@@ -1,0 +1,29 @@
+[Unit]
+Description=keyproxy: key-injecting OpenAI-compatible proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Secrets live only in this file, never in the binary or the repo. It must be
+# readable by root only, and it is required: the service refuses to start without it.
+EnvironmentFile=/etc/keyproxy.env
+Environment=BIND_ADDR=127.0.0.1:8787
+# Creates /var/lib/keyproxy owned by the dynamic user; the stats DB lives here.
+StateDirectory=keyproxy
+ExecStart=/usr/local/bin/keyproxy
+Restart=on-failure
+RestartSec=2
+
+# Hardening: this process needs the network and its env file, nothing else.
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

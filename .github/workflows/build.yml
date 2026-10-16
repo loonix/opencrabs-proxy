@@ -1,0 +1,29 @@
+name: build
+
+# Builds the x86_64 Linux release. No secrets are used: the binary carries no
+# upstream key or caller token, so the artifact is safe to publish. The key and
+# the token file are supplied at runtime on the server only.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: keyproxy-linux-x86_64
+          path: target/release/keyproxy
+          retention-days: 7
+          if-no-files-found: error

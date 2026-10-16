@@ -1,0 +1,31 @@
+[package]
+name = "keyproxy"
+version = "0.1.0"
+edition = "2021"
+description = "Key-injecting reverse proxy for an OpenAI-compatible upstream. Holds the real API key server-side and gates callers with per-caller tokens."
+license = "MIT"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "net", "io-util"] }
+bytes = "1"
+# rustls so the binary has no system OpenSSL dependency, which keeps deploys simple.
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+serde_json = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+futures-util = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
+sha2 = "0.10"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+
+[dev-dependencies]
+tower = { version = "0.4", features = ["util"] }
+http-body-util = "0.1"
