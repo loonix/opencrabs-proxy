@@ -243,8 +243,8 @@ mod tests {
             Some("/v1/images/generations")
         );
         assert_eq!(
-            path("/v1/models/cb/gemini-2.5-flash-image").as_deref(),
-            Some("/v1/models/cb/gemini-2.5-flash-image")
+            path("/v1/models/deepseek-v4.1-flash").as_deref(),
+            Some("/v1/models/deepseek-v4.1-flash")
         );
     }
 

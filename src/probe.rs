@@ -260,7 +260,7 @@ mod tests {
     }
 
     fn allowlist() -> Vec<String> {
-        vec!["cb/deepseek-v4.1-flash".to_string()]
+        vec!["deepseek-v4.1-flash".to_string()]
     }
 
     #[test]

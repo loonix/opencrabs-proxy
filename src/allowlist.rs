@@ -11,6 +11,14 @@
 //! and only on `/v1/audio/*` passthrough. A text request naming an audio model
 //! is refused, and an audio request naming a text model is refused. The three
 //! lists must not overlap.
+//!
+//! A capability shows the client one id. The chat list carries one id and the
+//! image list carries one id, so a picker built from `/v1/models`, or a
+//! `generation_model` set once on the client, can never offer a second
+//! spelling of the same model. Publisher-prefixed routing ids (`ali/...`,
+//! `cb/...`) belong in `ROTATION_MODELS`, where the proxy walks them and the
+//! client never sees them. Voice is the exception: its list is a chain, tried
+//! in order, and the caller names only the first id.
 
 use axum::{
     http::StatusCode,
@@ -19,17 +27,16 @@ use axum::{
 };
 use serde_json::{json, Value};
 
-/// Default chat ids served on `/v1/chat/completions`. Written the way the
-/// upstream lists them, `provider/model`, and sent on unchanged: the proxy
-/// never adds or strips a prefix, and a bare id is not an alias for a
-/// prefixed one. Set with `ALLOWED_MODELS`.
-pub const DEFAULT_MODELS: &str = "cb/deepseek-v4.1-flash";
+/// Default chat ids served on `/v1/chat/completions`. One id, in the exact
+/// spelling the upstream lists it: the proxy rotates between its own upstream
+/// keys behind that id, so a caller never picks a publisher and never sees a
+/// second spelling of the same model. Set with `ALLOWED_MODELS`.
+pub const DEFAULT_MODELS: &str = "deepseek-v4.1-flash";
 
-/// Image generation ids served on `/v1/images/*` only. Each id is written the
-/// way the upstream lists it, `provider/model`, and is sent on unchanged: the
-/// proxy never adds or strips a prefix. The bare id is listed too because the
-/// upstream serves it and clients already send it.
-pub const DEFAULT_IMAGE_MODELS: &str = "cb/gemini-2.5-flash-image,gemini-2.5-flash-image";
+/// Image generation ids served on `/v1/images/*` only. One id, in the exact
+/// spelling the upstream lists it. Set with `IMAGE_MODELS`; empty turns image
+/// generation off.
+pub const DEFAULT_IMAGE_MODELS: &str = "gemini-2.5-flash-image";
 
 /// Audio input ids. An id here is served only when a chat request carries an
 /// `input_audio` part, and only on `/v1/audio/*` passthrough. It is never a
@@ -201,9 +208,10 @@ mod tests {
     #[test]
     fn default_allows_only_flash() {
         let a = Allowlist::parse(DEFAULT_MODELS);
-        assert!(a.allows("cb/deepseek-v4.1-flash"));
-        assert!(!a.allows("deepseek-v4.1-flash"));
-        assert!(!a.allows("cb/deepseek-v4.1-pro"));
+        assert!(a.allows("deepseek-v4.1-flash"));
+        assert!(!a.allows("cb/deepseek-v4.1-flash"));
+        assert!(!a.allows("ali/deepseek-v4.1-flash"));
+        assert!(!a.allows("deepseek-v4.1-pro"));
         assert!(!a.allows(""));
     }
 
@@ -229,7 +237,7 @@ mod tests {
             .iter()
             .map(|m| m["id"].as_str().unwrap())
             .collect();
-        assert_eq!(ids, vec!["cb/deepseek-v4.1-flash"]);
+        assert_eq!(ids, vec!["deepseek-v4.1-flash"]);
     }
 
     #[test]
@@ -240,8 +248,8 @@ mod tests {
         assert_eq!(v, json!({"error": "nope"}));
     }
 
-    /// One image id, since the default list now carries two.
-    const IMG: &str = "cb/gemini-2.5-flash-image";
+    /// The image id the shipped defaults carry.
+    const IMG: &str = "gemini-2.5-flash-image";
     /// One audio id, since the list may carry fallbacks.
     const AUD: &str = "mimo/mimo-v2.6-flash";
 
@@ -258,7 +266,9 @@ mod tests {
     fn image_route_accepts_only_image_ids() {
         let a = Allowlist::parse(DEFAULT_MODELS).with_images(DEFAULT_IMAGE_MODELS);
         assert!(a.allows_for_path("/v1/images/generations", IMG));
-        assert!(a.allows_for_path("/v1/images/generations", "gemini-2.5-flash-image"));
+        assert!(a.allows_for_path("/v1/images/generations", DEFAULT_IMAGE_MODELS));
+        // A prefixed spelling of the same image model is not a second id.
+        assert!(!a.allows_for_path("/v1/images/generations", "cb/gemini-2.5-flash-image"));
         assert!(!a.allows_for_path("/v1/images/generations", DEFAULT_MODELS));
     }
 
@@ -314,6 +324,23 @@ mod tests {
         assert!(!a.allows_for_path("/v1/audio/transcriptions", DEFAULT_MODELS));
     }
 
+    /// What a client picks from is one id per capability: one chat id and one
+    /// image id. A second spelling of a model belongs in `ROTATION_MODELS`,
+    /// out of the client's sight, which is where the proxy walks it.
+    #[test]
+    fn shipped_defaults_show_one_id_per_capability() {
+        let a = Allowlist::parse(DEFAULT_MODELS).with_images(DEFAULT_IMAGE_MODELS);
+        assert_eq!(a.names(), "deepseek-v4.1-flash");
+        assert_eq!(a.image_names(), "gemini-2.5-flash-image");
+        let mut v = json!({"object": "list", "data": [
+            {"id": "deepseek-v4.1-flash"},
+            {"id": "ali/deepseek-v4.1-flash"},
+            {"id": "cb/deepseek-v4.1-flash"},
+        ]});
+        a.filter_models(&mut v);
+        assert_eq!(v["data"].as_array().unwrap().len(), 1);
+    }
+
     #[test]
     #[should_panic(expected = "must not overlap")]
     fn overlapping_audio_and_chat_ids_are_a_config_error() {
@@ -323,6 +350,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "must not overlap")]
     fn overlapping_image_and_chat_ids_are_a_config_error() {
-        Allowlist::parse(DEFAULT_MODELS).with_images("cb/deepseek-v4.1-flash");
+        Allowlist::parse(DEFAULT_MODELS).with_images(DEFAULT_MODELS);
     }
 }
