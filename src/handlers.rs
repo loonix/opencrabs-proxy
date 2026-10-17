@@ -40,6 +40,20 @@ pub fn rejected(state: &AppState, ip: String, endpoint: &'static str, status: St
     });
 }
 
+/// True when any message carries an `input_audio` part.
+fn carries_audio(body: &serde_json::Value) -> bool {
+    body.get("messages")
+        .and_then(|m| m.as_array())
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message
+                    .get("content")
+                    .and_then(|c| c.as_array())
+                    .is_some_and(|parts| parts.iter().any(|p| p.get("input_audio").is_some()))
+            })
+        })
+}
+
 /// Record and answer a request for a model the allowlist does not serve.
 pub fn refuse_model(
     state: &AppState,
@@ -152,7 +166,15 @@ pub async fn chat_completions(
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let plan = state.rotation.plan_for(&model_used);
+    // An audio request is pinned to the model the caller named. Only some
+    // models read audio, and the rotation candidates are text models, so
+    // rotating would answer with a complaint about a model the caller never
+    // sent.
+    let plan = if carries_audio(&body_json) {
+        vec![model_used.clone()]
+    } else {
+        state.rotation.plan_for(&model_used)
+    };
     let plan_len = plan.len() as u32;
     let first_byte_budget = state.rotation.first_byte_budget(body.len(), wants_stream);
     let start = Instant::now();
@@ -807,6 +829,32 @@ mod rotation_tests {
             .unwrap()
     }
 
+    /// A chat request whose message carries an `input_audio` part.
+    fn audio_chat_request(token: &str, model: &str) -> Request<Body> {
+        let body = serde_json::json!({
+            "model": model,
+            "stream": true,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what do you hear"},
+                    {"type": "input_audio", "input_audio": {"data": "T2dnUw==", "format": "ogg"}}
+                ]
+            }]
+        })
+        .to_string();
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .extension(ConnectInfo(
+                "127.0.0.1:65000".parse::<SocketAddr>().unwrap(),
+            ))
+            .body(Body::from(body))
+            .unwrap()
+    }
+
     /// The tracker row is written after the proxied body finishes, so poll
     /// the sqlite db until it appears.
     #[derive(Debug)]
@@ -958,6 +1006,60 @@ mod rotation_tests {
         assert_eq!(row.plan_len, Some(2));
         assert_eq!(row.failure_reason, None);
         assert!(!row.truncated);
+    }
+
+    #[test]
+    fn detects_audio_parts_and_ignores_text() {
+        let with_audio = serde_json::json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "what is this"},
+                {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "ogg"}}
+            ]}]
+        });
+        assert!(carries_audio(&with_audio));
+
+        let text_only = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        assert!(!carries_audio(&text_only));
+
+        assert!(!carries_audio(&serde_json::json!({})));
+    }
+
+    /// Audio is a narrow capability, so an audio request must never rotate
+    /// onto another model: the caller would get an answer, or a complaint,
+    /// about a model they never named.
+    #[tokio::test]
+    async fn an_audio_request_is_never_rotated_onto_another_model() {
+        let (upstream, count) = spawn_scripted_upstream(|n, _| {
+            if n == 0 {
+                http_error("503 Service Unavailable", "{}")
+            } else {
+                sse_ok("m2")
+            }
+        })
+        .await;
+        let app = test_app(upstream, &["m1", "m2"], Duration::from_secs(5)).await;
+        let token = app.token.clone();
+        let db = app.stats_db.clone();
+
+        let response = crate::build_router(Arc::clone(&app.state))
+            .oneshot(audio_chat_request(&token, "m1"))
+            .await
+            .unwrap();
+        // The upstream failure belongs to the model the caller named, and it
+        // is relayed instead of being papered over with m2's answer.
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "an audio request must not rotate onto a model the caller did not name"
+        );
+
+        let row = tracked_row(&db).await;
+        assert_eq!(row.model_used, "m1");
+        assert_eq!(row.attempts, Some(1));
+        assert_eq!(row.plan_len, Some(1));
     }
 
     #[tokio::test]
