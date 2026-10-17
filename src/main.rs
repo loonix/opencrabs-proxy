@@ -199,10 +199,19 @@ async fn main() {
     let vision_swap = env_flag("VISION_SWAP");
     let allowed_raw =
         std::env::var("ALLOWED_MODELS").unwrap_or_else(|_| allowlist::DEFAULT_MODELS.to_string());
-    let allow = allowlist::Allowlist::parse(&allowed_raw).with_images(
-        &std::env::var("IMAGE_MODELS")
-            .unwrap_or_else(|_| allowlist::DEFAULT_IMAGE_MODELS.to_string()),
-    );
+    // Three lists that never overlap: a chat id, an image id and an audio id
+    // each answer a different kind of request, and an id in two lists would
+    // let one kind of request reach a model that cannot serve it. Empty turns
+    // that kind off.
+    let allow = allowlist::Allowlist::parse(&allowed_raw)
+        .with_images(
+            &std::env::var("IMAGE_MODELS")
+                .unwrap_or_else(|_| allowlist::DEFAULT_IMAGE_MODELS.to_string()),
+        )
+        .with_audio(
+            &std::env::var("AUDIO_MODELS")
+                .unwrap_or_else(|_| allowlist::DEFAULT_AUDIO_MODELS.to_string()),
+        );
     let rotation = rotation::Rotation::parse(std::env::var("ROTATION_MODELS").ok().as_deref());
     let rotation_names = rotation.names();
     let rotation_secs = rotation.attempt_timeout().as_secs();
@@ -213,6 +222,7 @@ async fn main() {
 
     let models_list = allow.names();
     let images_list = allow.image_names();
+    let audio_list = allow.audio_names();
     let caps = caps::Caps::from_env();
     let limit = limit::InputLimit::from_env();
     let input_ceiling = if limit.enabled() {
@@ -285,7 +295,7 @@ async fn main() {
         .await
         .unwrap_or_else(|e| panic!("bind {bind}: {e}"));
     tracing::info!(
-        "keyproxy listening on {bind} (upstream {upstream}, rate {rate_max}/min per caller, vision_swap {vision_swap}, models {models_list}, image models {images_list}, stats {stats_db}, caps {:?}, input ceiling {input_ceiling}, calibration {calibration_note}, body limit {} MB, install route {install_note}, rotation [{rotation_names}] at {rotation_secs}s per attempt, keys [{key_labels}] active `{active_key}` floor {min_balance})",
+        "keyproxy listening on {bind} (upstream {upstream}, rate {rate_max}/min per caller, vision_swap {vision_swap}, models {models_list}, image models {images_list}, audio models {audio_list}, stats {stats_db}, caps {:?}, input ceiling {input_ceiling}, calibration {calibration_note}, body limit {} MB, install route {install_note}, rotation [{rotation_names}] at {rotation_secs}s per attempt, keys [{key_labels}] active `{active_key}` floor {min_balance})",
         caps,
         limit::MAX_BODY_BYTES / (1024 * 1024),
     );

@@ -147,9 +147,21 @@ pub async fn chat_completions(
     };
     let vision_swap = model_requested != model_used;
 
-    // Checked on the model that goes upstream, so a vision swap cannot route
-    // around the allowlist.
-    if !state.allow.allows(&model_used) {
+    // An audio request is checked against the audio list and a text request
+    // against the chat list. The two never overlap, so a voice note cannot be
+    // answered by a text model and a text prompt cannot be answered by a voice
+    // one. Checked on the model that goes upstream, so a vision swap cannot
+    // route around the allowlist either.
+    let is_audio = carries_audio(&body_json);
+    let audio_plan = if is_audio {
+        state.allow.audio_plan_for(&model_used)
+    } else {
+        None
+    };
+    if is_audio && audio_plan.is_none() {
+        return refuse_model(&state, ip, caller, endpoint, &model_used);
+    }
+    if !is_audio && !state.allow.allows(&model_used) {
         return refuse_model(&state, ip, caller, endpoint, &model_used);
     }
 
@@ -166,14 +178,12 @@ pub async fn chat_completions(
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    // An audio request is pinned to the model the caller named. Only some
-    // models read audio, and the rotation candidates are text models, so
-    // rotating would answer with a complaint about a model the caller never
-    // sent.
-    let plan = if carries_audio(&body_json) {
-        vec![model_used.clone()]
-    } else {
-        state.rotation.plan_for(&model_used)
+    // An audio request is tried on the audio list only: the requested id
+    // first, the remaining audio ids after it. The rotation candidates are
+    // text models, so they are never part of an audio plan.
+    let plan = match &audio_plan {
+        Some(plan) => plan.clone(),
+        None => state.rotation.plan_for(&model_used),
     };
     let plan_len = plan.len() as u32;
     let first_byte_budget = state.rotation.first_byte_budget(body.len(), wants_stream);
@@ -788,7 +798,9 @@ mod rotation_tests {
             tokens: std::sync::RwLock::new(tokens::TokenStore::load(&tokens_path).unwrap()),
             tokens_path,
             vision_swap: false,
-            allow: Allowlist::parse("m1,m2"),
+            // Chat ids m1/m2, audio ids a1/a2. The two lists never overlap,
+            // which is what keeps a voice note off a text model.
+            allow: Allowlist::parse("m1,m2").with_audio("a1,a2"),
             rotation: rotation::Rotation::for_tests(models, attempt_timeout),
             upstream: format!("http://{upstream}"),
             rate: rate::RateLimiter::new(10_000, Duration::from_secs(60)),
@@ -1026,16 +1038,26 @@ mod rotation_tests {
         assert!(!carries_audio(&serde_json::json!({})));
     }
 
-    /// Audio is a narrow capability, so an audio request must never rotate
-    /// onto another model: the caller would get an answer, or a complaint,
-    /// about a model they never named.
+    /// Audio is a narrow capability: an audio request is tried on the audio
+    /// list only, never on a rotation candidate. The rotation list here is
+    /// text models, so a fallback onto one would answer a voice note with a
+    /// model that cannot read it.
     #[tokio::test]
-    async fn an_audio_request_is_never_rotated_onto_another_model() {
-        let (upstream, count) = spawn_scripted_upstream(|n, _| {
+    async fn an_audio_request_falls_back_only_within_the_audio_list() {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let (upstream, count) = spawn_scripted_upstream(move |n, raw| {
+            let text = String::from_utf8_lossy(raw).to_string();
+            let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+            let model = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("model").and_then(|m| m.as_str().map(str::to_string)))
+                .unwrap_or_default();
+            recorder.lock().unwrap().push(model);
             if n == 0 {
                 http_error("503 Service Unavailable", "{}")
             } else {
-                sse_ok("m2")
+                sse_ok("a2")
             }
         })
         .await;
@@ -1044,22 +1066,55 @@ mod rotation_tests {
         let db = app.stats_db.clone();
 
         let response = crate::build_router(Arc::clone(&app.state))
-            .oneshot(audio_chat_request(&token, "m1"))
+            .oneshot(audio_chat_request(&token, "a1"))
             .await
             .unwrap();
-        // The upstream failure belongs to the model the caller named, and it
-        // is relayed instead of being papered over with m2's answer.
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
         assert_eq!(
-            count.load(Ordering::SeqCst),
-            1,
-            "an audio request must not rotate onto a model the caller did not name"
+            *seen.lock().unwrap(),
+            vec!["a1".to_string(), "a2".to_string()],
+            "an audio request must be tried on the audio list only"
         );
 
         let row = tracked_row(&db).await;
-        assert_eq!(row.model_used, "m1");
-        assert_eq!(row.attempts, Some(1));
-        assert_eq!(row.plan_len, Some(1));
+        assert_eq!(row.model_used, "a2");
+        assert_eq!(row.attempts, Some(2));
+        assert_eq!(row.plan_len, Some(2));
+        assert_eq!(row.served_index, Some(1));
+    }
+
+    /// The split runs both ways: a chat id is not an audio model, and an
+    /// audio id is not a chat model. A text prompt naming a voice model is
+    /// refused before anything goes upstream.
+    #[tokio::test]
+    async fn a_chat_id_is_refused_on_an_audio_request() {
+        let (upstream, count) = spawn_scripted_upstream(|_, _| sse_ok("a1")).await;
+        let app = test_app(upstream, &["m1", "m2"], Duration::from_secs(5)).await;
+        let token = app.token.clone();
+
+        let response = crate::build_router(Arc::clone(&app.state))
+            .oneshot(audio_chat_request(&token, "m1"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    /// And the reverse: an audio id on a plain text request is refused, so
+    /// mimo can only ever answer a request that carries audio.
+    #[tokio::test]
+    async fn an_audio_id_is_refused_on_a_text_request() {
+        let (upstream, count) = spawn_scripted_upstream(|_, _| sse_ok("a1")).await;
+        let app = test_app(upstream, &["m1", "m2"], Duration::from_secs(5)).await;
+        let token = app.token.clone();
+
+        let response = crate::build_router(Arc::clone(&app.state))
+            .oneshot(chat_request(&token, "a1", true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

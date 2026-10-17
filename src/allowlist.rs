@@ -4,7 +4,13 @@
 //!
 //! Image generation has its own list, `IMAGE_MODELS`. Its ids are served only
 //! on `/v1/images/*`, and chat or `/v1/models` refuse them, so an image model
-//! can never be used as a chat model. The two lists must not overlap.
+//! can never be used as a chat model.
+//!
+//! Audio input has its own list, `AUDIO_MODELS`, and it is narrower still: an
+//! id on it is served only when a chat request carries an `input_audio` part,
+//! and only on `/v1/audio/*` passthrough. A text request naming an audio model
+//! is refused, and an audio request naming a text model is refused. The three
+//! lists must not overlap.
 
 use axum::{
     http::StatusCode,
@@ -21,16 +27,28 @@ pub const DEFAULT_MODELS: &str = "cb/deepseek-v4.1-flash";
 
 /// Image generation ids served on `/v1/images/*` only. Each id is written the
 /// way the upstream lists it, `provider/model`, and is sent on unchanged: the
-/// proxy never adds or strips a prefix.
+/// proxy never adds or strips a prefix. The bare id is listed too because the
+/// upstream serves it and clients already send it.
 pub const DEFAULT_IMAGE_MODELS: &str = "cb/gemini-2.5-flash-image,gemini-2.5-flash-image";
+
+/// Audio input ids. An id here is served only when a chat request carries an
+/// `input_audio` part, and only on `/v1/audio/*` passthrough. It is never a
+/// chat model, so a text prompt cannot be answered by a voice model. The
+/// first id is tried first, the rest are fallbacks in order. Set with
+/// `AUDIO_MODELS`.
+pub const DEFAULT_AUDIO_MODELS: &str = "mimo/mimo-v2.6-flash";
 
 /// Path prefix that selects the image list instead of the chat list.
 const IMAGE_PATH_PREFIX: &str = "/v1/images/";
+
+/// Path prefix that selects the audio list instead of the chat list.
+const AUDIO_PATH_PREFIX: &str = "/v1/audio/";
 
 #[derive(Clone, Debug)]
 pub struct Allowlist {
     models: Vec<String>,
     images: Vec<String>,
+    audio: Vec<String>,
 }
 
 fn split_ids(raw: &str) -> Vec<String> {
@@ -50,6 +68,7 @@ impl Allowlist {
         Self {
             models,
             images: Vec::new(),
+            audio: Vec::new(),
         }
     }
 
@@ -67,6 +86,25 @@ impl Allowlist {
         self
     }
 
+    /// Attach the audio input list. Empty means audio input is off. Panics if
+    /// an id is also a chat or image model, since an audio id must never be
+    /// reachable from a text request.
+    pub fn with_audio(mut self, raw: &str) -> Self {
+        let audio = split_ids(raw);
+        for id in &audio {
+            assert!(
+                !self.models.contains(id),
+                "AUDIO_MODELS id `{id}` is also a chat model; the lists must not overlap"
+            );
+            assert!(
+                !self.images.contains(id),
+                "AUDIO_MODELS id `{id}` is also an image model; the lists must not overlap"
+            );
+        }
+        self.audio = audio;
+        self
+    }
+
     pub fn names(&self) -> String {
         self.models.join(",")
     }
@@ -81,6 +119,10 @@ impl Allowlist {
         self.images.join(",")
     }
 
+    pub fn audio_names(&self) -> String {
+        self.audio.join(",")
+    }
+
     pub fn allows(&self, model: &str) -> bool {
         self.models.iter().any(|m| m == model)
     }
@@ -89,11 +131,30 @@ impl Allowlist {
         self.images.iter().any(|m| m == model)
     }
 
-    /// Route-aware check: image routes accept only image ids, every other
-    /// route accepts only chat ids.
+    pub fn allows_audio(&self, model: &str) -> bool {
+        self.audio.iter().any(|m| m == model)
+    }
+
+    /// The models an audio request may be tried on, the requested id first and
+    /// the remaining audio ids after it as fallbacks. `None` when the id is not
+    /// on the audio list, so an audio request can never be served by a chat
+    /// model and a text request can never be served by an audio one.
+    pub fn audio_plan_for(&self, model: &str) -> Option<Vec<String>> {
+        if !self.allows_audio(model) {
+            return None;
+        }
+        let mut plan = vec![model.to_string()];
+        plan.extend(self.audio.iter().filter(|m| m.as_str() != model).cloned());
+        Some(plan)
+    }
+
+    /// Route-aware check: image routes accept only image ids, audio routes
+    /// only audio ids, every other route only chat ids.
     pub fn allows_for_path(&self, path: &str, model: &str) -> bool {
         if path.starts_with(IMAGE_PATH_PREFIX) {
             self.allows_image(model)
+        } else if path.starts_with(AUDIO_PATH_PREFIX) {
+            self.allows_audio(model)
         } else {
             self.allows(model)
         }
@@ -181,6 +242,8 @@ mod tests {
 
     /// One image id, since the default list now carries two.
     const IMG: &str = "cb/gemini-2.5-flash-image";
+    /// One audio id, since the list may carry fallbacks.
+    const AUD: &str = "mimo/mimo-v2.6-flash";
 
     #[test]
     fn image_id_is_never_a_chat_model() {
@@ -205,6 +268,7 @@ mod tests {
         let mut v = json!({"object": "list", "data": [
             {"id": DEFAULT_MODELS},
             {"id": IMG},
+            {"id": AUD},
         ]});
         a.filter_models(&mut v);
         assert_eq!(v["data"].as_array().unwrap().len(), 1);
@@ -216,6 +280,44 @@ mod tests {
         let a = Allowlist::parse(DEFAULT_MODELS);
         assert!(!a.allows_for_path("/v1/images/generations", IMG));
         assert_eq!(a.image_names(), "");
+    }
+
+    #[test]
+    fn audio_id_is_never_a_chat_model() {
+        let a = Allowlist::parse(DEFAULT_MODELS)
+            .with_images(DEFAULT_IMAGE_MODELS)
+            .with_audio(DEFAULT_AUDIO_MODELS);
+        assert!(a.allows_audio(AUD));
+        assert!(!a.allows(AUD));
+        assert!(!a.allows_for_path("/v1/chat/completions", AUD));
+        assert!(a.audio_plan_for(AUD).is_some());
+        assert!(a.audio_plan_for(DEFAULT_MODELS).is_none());
+    }
+
+    #[test]
+    fn audio_plan_puts_the_requested_id_first() {
+        let a = Allowlist::parse(DEFAULT_MODELS).with_audio("a/one,a/two,a/three");
+        assert_eq!(
+            a.audio_plan_for("a/two").unwrap(),
+            vec!["a/two", "a/one", "a/three"]
+        );
+        assert_eq!(
+            a.audio_plan_for("a/one").unwrap(),
+            vec!["a/one", "a/two", "a/three"]
+        );
+    }
+
+    #[test]
+    fn audio_route_accepts_only_audio_ids() {
+        let a = Allowlist::parse(DEFAULT_MODELS).with_audio(DEFAULT_AUDIO_MODELS);
+        assert!(a.allows_for_path("/v1/audio/transcriptions", AUD));
+        assert!(!a.allows_for_path("/v1/audio/transcriptions", DEFAULT_MODELS));
+    }
+
+    #[test]
+    #[should_panic(expected = "must not overlap")]
+    fn overlapping_audio_and_chat_ids_are_a_config_error() {
+        Allowlist::parse(DEFAULT_MODELS).with_audio(DEFAULT_MODELS);
     }
 
     #[test]

@@ -14,8 +14,7 @@
 //! first puts audio-only and image ids into the fallback chain, and an audio
 //! or image request that rotates lands on a model that cannot answer it.
 //!
-//! The requested model always tries first, even when the configured list
-//! starts elsewhere. A plan holds at most [`MAX_ATTEMPTS`] candidates, and
+//! A plan holds at most [`MAX_ATTEMPTS`] candidates, and
 //! each attempt bounds only the wait for response headers with
 //! `ROTATION_ATTEMPT_TIMEOUT_SECS`, so a hung upstream cannot pin a request
 //! for the client's whole timeout and a streaming body is never cut
