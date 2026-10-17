@@ -15,6 +15,7 @@ Supported routes:
 
 - `POST /v1/chat/completions` (streaming and non-streaming, with token usage tracked)
 - `GET /v1/models` (non-chat models are filtered out)
+- `POST /v1/images/generations`, when `IMAGE_MODELS` is set. The body must name one of those ids, written exactly as the upstream lists it (`provider/model`); the proxy sends it on unchanged. Responses stream back as the upstream sends them
 - Any other `/v1/*` route (for example `/v1/responses`) is forwarded as-is. Usage is not read from those.
 
 A request without a valid token gets `401`. Unknown paths outside `/v1/` get `404`.
@@ -43,6 +44,8 @@ Set these in the environment. Required values stop the process at startup if mis
 | `TOKENS_FILE` | yes | Issued caller token hashes |
 | `BIND_ADDR` | no | Default `127.0.0.1:8787` |
 | `RATE_MAX_PER_MIN` | no | Default 60 per caller |
+| `ALLOWED_MODELS` | no | Comma list of chat model ids this proxy serves. Default `deepseek-v4.1-flash`. Any other id is refused before the upstream call, and `/v1/models` lists only these |
+| `IMAGE_MODELS` | no | Comma list of image generation ids, served only on `/v1/images/*`. Default `cb/gemini-2.5-flash-image`. Ids are written exactly as the upstream lists them, `provider/model`, and are sent on unchanged: the proxy never adds or strips a prefix. Empty turns image generation off. An id may not also appear in `ALLOWED_MODELS` |
 | `STATS_DB` | no | SQLite path for usage rows |
 | `VISION_SWAP` | no | Off by default. Routes image requests to `DEFAULT_VISION_MODEL` in `src/vision.rs`. Only enable it for an upstream that serves that model |
 | `ROTATION_MODELS` | no | Comma list of chat model ids to try in order when one fails. Defaults to `ALLOWED_MODELS`, so a single-model proxy never rotates |

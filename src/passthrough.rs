@@ -10,53 +10,9 @@ use axum::{
 };
 use std::{net::SocketAddr, sync::Arc, time::Instant};
 
-use crate::{
-    allowlist::upstream_image_id, guard, handlers, limit, tracker::RequestRecord, AppState,
-};
+use crate::{guard, handlers, limit, tracker::RequestRecord, AppState};
 
 const ENDPOINT: &str = "/v1/* passthrough";
-
-/// Rewrites the `model` of an image request to the upstream id. Everything else
-/// in the body is kept as the caller sent it.
-fn upstream_image_body(body: &Bytes) -> Result<Bytes, serde_json::Error> {
-    let mut v: serde_json::Value = serde_json::from_slice(body)?;
-    let id = v
-        .get("model")
-        .and_then(|m| m.as_str())
-        .unwrap_or_default()
-        .to_string();
-    v["model"] = serde_json::Value::String(upstream_image_id(&id));
-    serde_json::to_vec(&v).map(Bytes::from)
-}
-
-/// The `model` the caller named, if the body is JSON and names one.
-fn requested_model(body: &Bytes) -> Option<String> {
-    serde_json::from_slice::<serde_json::Value>(body)
-        .ok()?
-        .get("model")?
-        .as_str()
-        .map(str::to_string)
-}
-
-/// Replaces every upstream image id in an image response with the bare id the
-/// caller sent. The upstream route prefix never reaches the caller.
-fn unprefix_image_body(body: &[u8], bare_id: &str) -> Vec<u8> {
-    let from = upstream_image_id(bare_id);
-    let from = from.as_bytes();
-    let to = bare_id.as_bytes();
-    let mut out = Vec::with_capacity(body.len());
-    let mut i = 0;
-    while i < body.len() {
-        if body[i..].starts_with(from) {
-            out.extend_from_slice(to);
-            i += from.len();
-        } else {
-            out.push(body[i]);
-            i += 1;
-        }
-    }
-    out
-}
 
 /// The caller's path and query, with the path checked for a dot segment.
 ///
@@ -188,25 +144,6 @@ pub async fn passthrough(
         }
     }
 
-    // Image routes: the bare id the caller sent was checked above. It becomes the
-    // upstream id only here, so the gates never see the upstream prefix.
-    let image_bare = if uri.path().starts_with("/v1/images/") {
-        requested_model(&body)
-    } else {
-        None
-    };
-    let body = if image_bare.is_some() {
-        match upstream_image_body(&body) {
-            Ok(rewritten) => rewritten,
-            Err(e) => {
-                tracing::error!("image body rewrite failed after the gate passed: {e}");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        }
-    } else {
-        body
-    };
-
     let Ok(upstream_method) = reqwest::Method::from_bytes(method.as_str().as_bytes()) else {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     };
@@ -261,24 +198,6 @@ pub async fn passthrough(
     if let Some(ct) = resp.headers().get(header::CONTENT_TYPE) {
         out = out.header(header::CONTENT_TYPE, ct.clone());
     }
-    // Image responses are buffered so the upstream id can be replaced before the
-    // body leaves the proxy. Every other route streams as the upstream sends it.
-    if let Some(bare) = image_bare {
-        let bytes = match resp.bytes().await {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!("image response read error: {e}");
-                return (StatusCode::BAD_GATEWAY, "upstream error").into_response();
-            }
-        };
-        return match out.body(Body::from(unprefix_image_body(&bytes, &bare))) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("image response build error: {e}");
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
-            }
-        };
-    }
     match out.body(Body::from_stream(resp.bytes_stream())) {
         Ok(r) => r,
         Err(e) => {
@@ -291,32 +210,6 @@ pub async fn passthrough(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn image_body_gets_the_upstream_id_and_keeps_the_rest() {
-        let body = Bytes::from_static(br#"{"model":"gemini-3.1-flash-image","prompt":"a crab"}"#);
-        let out: serde_json::Value =
-            serde_json::from_slice(&upstream_image_body(&body).unwrap()).unwrap();
-        assert_eq!(out["model"], "cb/gemini-3.1-flash-image");
-        assert_eq!(out["prompt"], "a crab");
-    }
-
-    #[test]
-    fn image_response_drops_the_upstream_prefix() {
-        let body = br#"{"model":"cb/gemini-3.1-flash-image","data":[{"b64_json":"QUJD"}]}"#;
-        let out = unprefix_image_body(body, "gemini-3.1-flash-image");
-        let out = String::from_utf8(out).unwrap();
-        assert!(out.contains(r#""model":"gemini-3.1-flash-image""#));
-        assert!(!out.contains("cb/"));
-        assert!(out.contains("QUJD"));
-    }
-
-    #[test]
-    fn image_response_without_the_prefix_is_unchanged() {
-        let body = br#"{"model":"gemini-3.1-flash-image","data":[]}"#;
-        let out = unprefix_image_body(body, "gemini-3.1-flash-image");
-        assert_eq!(out, body.to_vec());
-    }
 
     fn path(raw: &str) -> Option<String> {
         safe_path_and_query(&raw.parse::<Uri>().unwrap())
@@ -350,8 +243,8 @@ mod tests {
             Some("/v1/images/generations")
         );
         assert_eq!(
-            path("/v1/models/gemini-3.1-flash-image").as_deref(),
-            Some("/v1/models/gemini-3.1-flash-image")
+            path("/v1/models/cb/gemini-2.5-flash-image").as_deref(),
+            Some("/v1/models/cb/gemini-2.5-flash-image")
         );
     }
 

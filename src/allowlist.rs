@@ -15,18 +15,10 @@ use serde_json::{json, Value};
 
 pub const DEFAULT_MODELS: &str = "deepseek-v4.1-flash";
 
-/// Image generation ids served on `/v1/images/*` only. Callers send the bare id;
-/// the proxy adds `IMAGE_UPSTREAM_PREFIX` on the upstream request.
-pub const DEFAULT_IMAGE_MODELS: &str = "gemini-3.1-flash-image";
-
-/// Prefix the upstream expects on image model ids. Added here, never by callers,
-/// so the upstream route name is not part of anything a client sees.
-pub const IMAGE_UPSTREAM_PREFIX: &str = "cb/";
-
-/// The id the upstream receives for an image model the caller named.
-pub fn upstream_image_id(id: &str) -> String {
-    format!("{IMAGE_UPSTREAM_PREFIX}{id}")
-}
+/// Image generation ids served on `/v1/images/*` only. Each id is written the
+/// way the upstream lists it, `provider/model`, and is sent on unchanged: the
+/// proxy never adds or strips a prefix.
+pub const DEFAULT_IMAGE_MODELS: &str = "cb/gemini-2.5-flash-image";
 
 /// Path prefix that selects the image list instead of the chat list.
 const IMAGE_PATH_PREFIX: &str = "/v1/images/";
@@ -181,19 +173,10 @@ mod tests {
         assert!(!a.allows(DEFAULT_IMAGE_MODELS));
         assert!(a.allows_for_path("/v1/chat/completions", "deepseek-v4.1-flash"));
         assert!(!a.allows_for_path("/v1/chat/completions", DEFAULT_IMAGE_MODELS));
-        assert!(!a.allows_for_path("/v1/models/gemini-3.1-flash-image", DEFAULT_IMAGE_MODELS));
-    }
-
-    #[test]
-    fn upstream_id_adds_the_prefix_only_for_the_upstream() {
-        assert_eq!(
-            upstream_image_id("gemini-3.1-flash-image"),
-            "cb/gemini-3.1-flash-image"
-        );
-        assert_eq!(
-            upstream_image_id(DEFAULT_IMAGE_MODELS),
-            "cb/gemini-3.1-flash-image"
-        );
+        assert!(!a.allows_for_path(
+            &format!("/v1/models/{DEFAULT_IMAGE_MODELS}"),
+            DEFAULT_IMAGE_MODELS
+        ));
     }
 
     #[test]
