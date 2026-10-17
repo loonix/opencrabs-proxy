@@ -198,23 +198,40 @@ pub async fn chat_completions(
     };
     let vision_swap = model_requested != model_used;
 
+    // An id the client names that this proxy serves under another spelling, but
+    // that names the capability of this request, is resolved to the served id
+    // rather than refused: a client built against older docs keeps working.
     // An audio request is checked against the audio list and a text request
     // against the chat list. The two never overlap, so a voice note cannot be
     // answered by a text model and a text prompt cannot be answered by a voice
-    // one. Checked on the model that goes upstream, so a vision swap cannot
+    // one. Resolved on the model that goes upstream, so a vision swap cannot
     // route around the allowlist either.
     let is_audio = carries_audio(&body_json);
+    let resolved = if is_audio {
+        state.allow.resolve_audio(&model_used)
+    } else {
+        state.allow.resolve_chat(&model_used)
+    };
+    let Some(model_used) = resolved else {
+        return refuse_model(&state, ip, caller, endpoint, &model_used);
+    };
+    if model_used != body_json["model"].as_str().unwrap_or_default() {
+        tracing::info!(
+            "model alias: `{}` is served as `{model_used}`",
+            model_requested
+        );
+        body_json["model"] = serde_json::Value::String(model_used.clone());
+    }
+
+    // An audio request is tried on the audio list only: the requested id
+    // first, the remaining audio ids after it. The list is non-empty whenever
+    // the id resolved, so the plan exists for every audio request that passed
+    // the check above.
     let audio_plan = if is_audio {
         state.allow.audio_plan_for(&model_used)
     } else {
         None
     };
-    if is_audio && audio_plan.is_none() {
-        return refuse_model(&state, ip, caller, endpoint, &model_used);
-    }
-    if !is_audio && !state.allow.allows(&model_used) {
-        return refuse_model(&state, ip, caller, endpoint, &model_used);
-    }
 
     // Whether the caller asked for a stream decides how the request is timed
     // below and whether the upstream is asked for token usage.
@@ -765,7 +782,7 @@ pub async fn health() -> &'static str {
 }
 
 #[cfg(test)]
-mod rotation_tests {
+pub(crate) mod rotation_tests {
     use super::*;
     use crate::allowlist::Allowlist;
     use crate::{caps, rate, rotation, tokens, tracker};
@@ -784,7 +801,7 @@ mod rotation_tests {
     /// A responder that returns bytes gets its socket closed after the write,
     /// which ends any proxied SSE body; one that returns nothing keeps the
     /// socket open, which is what makes an upstream hang.
-    async fn spawn_scripted_upstream(
+    pub(crate) async fn spawn_scripted_upstream(
         responder: impl Fn(usize, &[u8]) -> Vec<u8> + Send + Sync + 'static,
     ) -> (SocketAddr, Arc<AtomicUsize>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -818,10 +835,10 @@ mod rotation_tests {
         (addr, count)
     }
 
-    struct TestApp {
-        state: Arc<AppState>,
-        token: String,
-        stats_db: std::path::PathBuf,
+    pub(crate) struct TestApp {
+        pub(crate) state: Arc<AppState>,
+        pub(crate) token: String,
+        pub(crate) stats_db: std::path::PathBuf,
     }
 
     async fn test_app(upstream: SocketAddr, models: &[&str], attempt_timeout: Duration) -> TestApp {
@@ -868,6 +885,21 @@ mod rotation_tests {
             Some("fallback-key"),
             Some(&joined),
         );
+        app
+    }
+
+    /// The same app with an image list of its own, so a test can watch an id
+    /// resolve on an image route.
+    pub(crate) async fn test_app_with_images(
+        upstream: SocketAddr,
+        models: &[&str],
+        images: &str,
+    ) -> TestApp {
+        let mut app = test_app(upstream, models, Duration::from_secs(5)).await;
+        let state = Arc::get_mut(&mut app.state).expect("state is freshly built");
+        state.allow = Allowlist::parse("m1,m2")
+            .with_images(images)
+            .with_audio("a1,a2");
         app
     }
 
@@ -969,16 +1001,18 @@ mod rotation_tests {
     /// The tracker row is written after the proxied body finishes, so poll
     /// the sqlite db until it appears.
     #[derive(Debug)]
-    struct TrackedRow {
-        model_used: String,
-        status: u16,
-        failure_reason: Option<String>,
-        attempts: Option<u32>,
-        plan_len: Option<u32>,
-        served_index: Option<u32>,
-        truncated: bool,
-        key_label: String,
-        estimated_tokens: Option<u64>,
+    pub(crate) struct TrackedRow {
+        /// What the caller asked for, which an alias leaves in its own spelling.
+        pub(crate) model_requested: String,
+        pub(crate) model_used: String,
+        pub(crate) status: u16,
+        pub(crate) failure_reason: Option<String>,
+        pub(crate) attempts: Option<u32>,
+        pub(crate) plan_len: Option<u32>,
+        pub(crate) served_index: Option<u32>,
+        pub(crate) truncated: bool,
+        pub(crate) key_label: String,
+        pub(crate) estimated_tokens: Option<u64>,
     }
 
     async fn tracked_row(db: &std::path::Path) -> TrackedRow {
@@ -987,26 +1021,28 @@ mod rotation_tests {
 
     /// The latest row for one endpoint. The passthrough writes its own endpoint
     /// label, so a refusal test has to name the route it posted to.
-    async fn tracked_row_for(db: &std::path::Path, endpoint: &str) -> TrackedRow {
+    pub(crate) async fn tracked_row_for(db: &std::path::Path, endpoint: &str) -> TrackedRow {
         for _ in 0..60 {
             if let Ok(conn) = rusqlite::Connection::open(db) {
                 let row = conn.query_row(
-                    "SELECT model_used, status, failure_reason, attempts, plan_len, \
-                            served_index, truncated, key_label, estimated_tokens \
+                    "SELECT COALESCE(model_requested, ''), model_used, status, failure_reason, \
+                            attempts, plan_len, served_index, truncated, key_label, \
+                            estimated_tokens \
                      FROM requests WHERE endpoint = ?1 \
                      ORDER BY id DESC LIMIT 1",
                     [endpoint],
                     |row| {
                         Ok(TrackedRow {
-                            model_used: row.get(0)?,
-                            status: row.get(1)?,
-                            failure_reason: row.get(2)?,
-                            attempts: row.get::<_, Option<i64>>(3)?.map(|n| n as u32),
-                            plan_len: row.get::<_, Option<i64>>(4)?.map(|n| n as u32),
-                            served_index: row.get::<_, Option<i64>>(5)?.map(|n| n as u32),
-                            truncated: row.get::<_, i64>(6)? != 0,
-                            key_label: row.get(7)?,
-                            estimated_tokens: row.get::<_, Option<i64>>(8)?.map(|n| n as u64),
+                            model_requested: row.get(0)?,
+                            model_used: row.get(1)?,
+                            status: row.get(2)?,
+                            failure_reason: row.get(3)?,
+                            attempts: row.get::<_, Option<i64>>(4)?.map(|n| n as u32),
+                            plan_len: row.get::<_, Option<i64>>(5)?.map(|n| n as u32),
+                            served_index: row.get::<_, Option<i64>>(6)?.map(|n| n as u32),
+                            truncated: row.get::<_, i64>(7)? != 0,
+                            key_label: row.get(8)?,
+                            estimated_tokens: row.get::<_, Option<i64>>(9)?.map(|n| n as u64),
                         })
                     },
                 );
@@ -1024,7 +1060,7 @@ mod rotation_tests {
         (row.model_used, row.status)
     }
 
-    fn sse_ok(model: &str) -> Vec<u8> {
+    pub(crate) fn sse_ok(model: &str) -> Vec<u8> {
         let head =
             b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
         let events = format!(
@@ -1037,12 +1073,69 @@ mod rotation_tests {
         raw
     }
 
-    fn http_error(status: &str, body: &str) -> Vec<u8> {
+    pub(crate) fn http_error(status: &str, body: &str) -> Vec<u8> {
         format!(
             "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
             body.len()
         )
         .into_bytes()
+    }
+
+    /// A 200 with a JSON body, for the routes that answer with a document.
+    pub(crate) fn json_ok(body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    /// The model id a raw request carried, read off its JSON body.
+    pub(crate) fn body_model(raw: &[u8]) -> String {
+        let text = String::from_utf8_lossy(raw);
+        let body = text.split("\r\n\r\n").nth(1).unwrap_or("");
+        serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("model").and_then(|m| m.as_str().map(str::to_string)))
+            .unwrap_or_default()
+    }
+
+    /// The request line a raw request carried, so a test can read the path the
+    /// upstream was asked for.
+    pub(crate) fn request_line(raw: &[u8]) -> String {
+        String::from_utf8_lossy(raw)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// A JSON POST to any `/v1/*` route, for the pass-through tests.
+    pub(crate) fn json_post(token: &str, path: &str, model: &str) -> Request<Body> {
+        let body = serde_json::json!({"model": model, "prompt": "hi"}).to_string();
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .extension(ConnectInfo(
+                "127.0.0.1:65000".parse::<SocketAddr>().unwrap(),
+            ))
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    /// A GET of one model id, which the pass-through rewrites in the path.
+    pub(crate) fn models_get(token: &str, id: &str) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(format!("/v1/models/{id}"))
+            .header("authorization", format!("Bearer {token}"))
+            .extension(ConnectInfo(
+                "127.0.0.1:65000".parse::<SocketAddr>().unwrap(),
+            ))
+            .body(Body::empty())
+            .unwrap()
     }
 
     /// The same, with one extra response header, for the rate-limit hint.
@@ -1333,6 +1426,62 @@ mod rotation_tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    /// An id the docs ship for voice, which this proxy does not serve under that
+    /// spelling, is served on the head of the voice chain instead of refused.
+    /// The upstream sees the served id, and the row keeps the caller's spelling
+    /// next to what answered.
+    #[tokio::test]
+    async fn an_audio_alias_is_served_on_the_voice_chain() {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let (upstream, count) = spawn_scripted_upstream(move |_, raw| {
+            recorder.lock().unwrap().push(body_model(raw));
+            sse_ok("a1")
+        })
+        .await;
+        let app = test_app(upstream, &["m1", "m2"], Duration::from_secs(5)).await;
+        let token = app.token.clone();
+        let db = app.stats_db.clone();
+
+        let response = crate::build_router(Arc::clone(&app.state))
+            .oneshot(audio_chat_request(&token, "qwen3.8-omni-flash"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["a1".to_string()],
+            "a voice alias must reach the upstream as the head of the voice chain"
+        );
+
+        let row = tracked_row(&db).await;
+        assert_eq!(row.model_requested, "qwen3.8-omni-flash");
+        assert_eq!(row.model_used, "a1");
+        assert_eq!(row.status, 200);
+    }
+
+    /// An id that is neither served nor an alias is still refused, so the
+    /// alias table does not turn into an open door.
+    #[tokio::test]
+    async fn an_id_that_is_neither_served_nor_an_alias_is_refused() {
+        let (upstream, count) = spawn_scripted_upstream(|_, _| sse_ok("m1")).await;
+        let app = test_app(upstream, &["m1", "m2"], Duration::from_secs(5)).await;
+        let token = app.token.clone();
+        let db = app.stats_db.clone();
+
+        let response = crate::build_router(Arc::clone(&app.state))
+            .oneshot(chat_request(&token, "gpt-4", true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+
+        let row = tracked_row(&db).await;
+        assert_eq!(row.model_requested, "gpt-4");
+        assert_eq!(row.status, 403);
     }
 
     #[tokio::test]

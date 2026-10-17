@@ -114,32 +114,50 @@ pub async fn passthrough(
         return handlers::refuse_input(&state, ip, caller, ENDPOINT, scaled, body.len());
     }
 
-    // Only allowlisted model ids may be named, in the path or in the JSON body.
-    // Image routes take the image list, every other route the chat list.
+    // Only served model ids may be named, in the path or in the JSON body. An
+    // id the client names that this proxy serves under another spelling, but
+    // that names the capability of the route, is resolved to the served id
+    // instead of refused. Image routes take the image list, audio routes the
+    // audio list, every other route the chat list. The path and the body are
+    // rewritten only when the id resolved elsewhere, so a request naming a
+    // served id is forwarded byte for byte.
+    let mut path_and_query = path_and_query;
+    let mut body = body;
     if let Some(id) = uri.path().strip_prefix("/v1/models/") {
-        if !state.allow.allows_for_path(uri.path(), id) {
+        let Some(served) = state.allow.resolve_for_path(uri.path(), id) else {
             return handlers::refuse_model(&state, ip, caller, ENDPOINT, id);
+        };
+        if served != id {
+            tracing::info!("model alias: `/v1/models/{id}` is served as `{served}`");
+            path_and_query = match path_and_query.split_once('?') {
+                Some((_, query)) => format!("/v1/models/{served}?{query}"),
+                None => format!("/v1/models/{served}"),
+            };
         }
     }
+    let parsed = serde_json::from_slice::<serde_json::Value>(&body).ok();
+    let named = parsed
+        .as_ref()
+        .and_then(|v| v.get("model").and_then(|m| m.as_str().map(str::to_string)));
     // An image route must name an image id: a body with no model is refused,
     // so it cannot reach upstream on a default model.
-    if uri.path().starts_with("/v1/images/") {
-        let named = serde_json::from_slice::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|v| v.get("model").and_then(|m| m.as_str().map(str::to_string)));
-        if named
-            .as_deref()
-            .is_none_or(|m| !state.allow.allows_image(m))
-        {
-            let refused = named.unwrap_or_default();
-            return handlers::refuse_model(&state, ip, caller, ENDPOINT, &refused);
-        }
+    if uri.path().starts_with("/v1/images/") && named.is_none() {
+        return handlers::refuse_model(&state, ip, caller, ENDPOINT, "");
     }
-    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) {
-        if let Some(model) = v.get("model") {
-            let model = model.as_str().unwrap_or("");
-            if !state.allow.allows_for_path(uri.path(), model) {
-                return handlers::refuse_model(&state, ip, caller, ENDPOINT, model);
+    if let Some(model) = named {
+        let Some(served) = state.allow.resolve_for_path(uri.path(), &model) else {
+            return handlers::refuse_model(&state, ip, caller, ENDPOINT, &model);
+        };
+        if served != model {
+            tracing::info!("model alias: `{model}` is served as `{served}`");
+            let mut v = parsed.unwrap_or_else(|| serde_json::json!({}));
+            v["model"] = serde_json::Value::String(served);
+            match serde_json::to_vec(&v) {
+                Ok(bytes) => body = Bytes::from(bytes),
+                Err(e) => {
+                    tracing::warn!("model alias: `{model}` could not be rewritten: {e}");
+                    return handlers::refuse_model(&state, ip, caller, ENDPOINT, &model);
+                }
             }
         }
     }
@@ -210,6 +228,13 @@ pub async fn passthrough(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handlers::rotation_tests::{
+        body_model, json_ok, json_post, models_get, request_line, spawn_scripted_upstream,
+        test_app_with_images, tracked_row_for,
+    };
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use tower::ServiceExt;
 
     fn path(raw: &str) -> Option<String> {
         safe_path_and_query(&raw.parse::<Uri>().unwrap())
@@ -254,5 +279,110 @@ mod tests {
             path("/v1/embeddings?x=1&y=..%2f").as_deref(),
             Some("/v1/embeddings?x=1&y=..%2f")
         );
+    }
+
+    /// An image request naming the id the docs ship reaches the upstream as the
+    /// image id this proxy serves, so a client built against older docs keeps
+    /// generating images.
+    #[tokio::test]
+    async fn an_image_alias_is_forwarded_as_the_served_id() {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let (upstream, count) = spawn_scripted_upstream(move |_, raw| {
+            recorder.lock().unwrap().push(body_model(raw));
+            json_ok("{\"data\":[{\"url\":\"http://upstream/1.png\"}]}")
+        })
+        .await;
+        let app = test_app_with_images(upstream, &["m1"], "gemini-2.5-flash-image").await;
+        let token = app.token.clone();
+        let db = app.stats_db.clone();
+
+        let response = crate::build_router(Arc::clone(&app.state))
+            .oneshot(json_post(
+                &token,
+                "/v1/images/generations",
+                "gemini-3.1-flash-image",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["gemini-2.5-flash-image".to_string()],
+            "an image alias must reach the upstream as the served image id"
+        );
+
+        let row = tracked_row_for(&db, ENDPOINT).await;
+        assert_eq!(row.status, 200);
+    }
+
+    /// A models path naming an id this proxy does not serve is refused, so the id
+    /// in the path is checked before anything goes upstream.
+    #[tokio::test]
+    async fn a_models_path_naming_an_unsupported_id_is_refused() {
+        let (upstream, count) = spawn_scripted_upstream(|_, _| json_ok("{}")).await;
+        let app = test_app_with_images(upstream, &["m1"], "gemini-2.5-flash-image").await;
+        let token = app.token.clone();
+        let db = app.stats_db.clone();
+
+        let response = crate::build_router(Arc::clone(&app.state))
+            .oneshot(models_get(&token, "gpt-4"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+
+        let row = tracked_row_for(&db, ENDPOINT).await;
+        assert_eq!(row.model_requested, "gpt-4");
+        assert_eq!(row.status, 403);
+    }
+
+    /// An id this proxy serves on a models path is forwarded as it was named:
+    /// the path is rewritten only when the id resolved elsewhere.
+    #[tokio::test]
+    async fn a_served_id_on_a_models_path_is_forwarded_unchanged() {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let (upstream, count) = spawn_scripted_upstream(move |_, raw| {
+            recorder.lock().unwrap().push(request_line(raw));
+            json_ok("{\"id\":\"m1\"}")
+        })
+        .await;
+        let app = test_app_with_images(upstream, &["m1"], "gemini-2.5-flash-image").await;
+        let token = app.token.clone();
+
+        let response = crate::build_router(Arc::clone(&app.state))
+            .oneshot(models_get(&token, "m1"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        let line = seen.lock().unwrap()[0].clone();
+        assert!(
+            line.contains("/v1/models/m1"),
+            "a served id must be forwarded on the path the caller named: {line}"
+        );
+    }
+
+    /// An id that is neither served nor an alias is refused before anything
+    /// goes upstream, on a pass-through route as much as on chat.
+    #[tokio::test]
+    async fn an_id_that_is_neither_served_nor_an_alias_is_refused_on_a_route() {
+        let (upstream, count) = spawn_scripted_upstream(|_, _| json_ok("{}")).await;
+        let app = test_app_with_images(upstream, &["m1"], "gemini-2.5-flash-image").await;
+        let token = app.token.clone();
+        let db = app.stats_db.clone();
+
+        let response = crate::build_router(Arc::clone(&app.state))
+            .oneshot(json_post(&token, "/v1/images/generations", "gpt-4"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+
+        let row = tracked_row_for(&db, ENDPOINT).await;
+        assert_eq!(row.model_requested, "gpt-4");
+        assert_eq!(row.status, 403);
     }
 }

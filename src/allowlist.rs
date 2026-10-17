@@ -19,6 +19,13 @@
 //! `cb/...`) belong in `ROTATION_MODELS`, where the proxy walks them and the
 //! client never sees them. Voice is the exception: its list is a chain, tried
 //! in order, and the caller names only the first id.
+//!
+//! An id a client names that this proxy does not serve under that spelling is
+//! resolved to the id served for the requested capability when the id is a
+//! published alias (see [`crate::alias`]), and refused otherwise. Resolution is
+//! scoped to the capability of the route, so an alias can never move a request
+//! onto another capability's model, and an alias is never advertised: the
+//! `/v1/models` list carries the served id only.
 
 use axum::{
     http::StatusCode,
@@ -26,6 +33,8 @@ use axum::{
     Json,
 };
 use serde_json::{json, Value};
+
+use crate::alias;
 
 /// Default chat ids served on `/v1/chat/completions`. One id, in the exact
 /// spelling the upstream lists it: the proxy rotates between its own upstream
@@ -134,10 +143,6 @@ impl Allowlist {
         self.models.iter().any(|m| m == model)
     }
 
-    pub fn allows_image(&self, model: &str) -> bool {
-        self.images.iter().any(|m| m == model)
-    }
-
     pub fn allows_audio(&self, model: &str) -> bool {
         self.audio.iter().any(|m| m == model)
     }
@@ -155,15 +160,49 @@ impl Allowlist {
         Some(plan)
     }
 
-    /// Route-aware check: image routes accept only image ids, audio routes
-    /// only audio ids, every other route only chat ids.
-    pub fn allows_for_path(&self, path: &str, model: &str) -> bool {
+    /// Resolve a named id inside one capability: the id itself when the list
+    /// carries it, otherwise the id the proxy serves for that capability when
+    /// the named id is a published alias for it. `None` when the id is neither
+    /// served nor a known alias, which keeps an unknown id refused.
+    fn resolve_within(
+        &self,
+        model: &str,
+        capability: alias::Capability,
+        list: &[String],
+    ) -> Option<String> {
+        if list.iter().any(|m| m == model) {
+            return Some(model.to_string());
+        }
+        alias::resolve(model, capability, list.first().map(String::as_str))
+    }
+
+    /// The id a text request is served under.
+    pub fn resolve_chat(&self, model: &str) -> Option<String> {
+        self.resolve_within(model, alias::Capability::Chat, &self.models)
+    }
+
+    /// The id an image request is served under. `None` when image generation is
+    /// off, so an alias cannot turn it back on.
+    pub fn resolve_image(&self, model: &str) -> Option<String> {
+        self.resolve_within(model, alias::Capability::Image, &self.images)
+    }
+
+    /// The id an audio-carrying request is served under. The id it resolves to
+    /// is the head of the voice chain, which is what `audio_plan_for` then walks.
+    pub fn resolve_audio(&self, model: &str) -> Option<String> {
+        self.resolve_within(model, alias::Capability::Audio, &self.audio)
+    }
+
+    /// The same resolution for a route that does not decide its own capability:
+    /// image routes take the image list, audio routes the audio list, every
+    /// other route the chat list.
+    pub fn resolve_for_path(&self, path: &str, model: &str) -> Option<String> {
         if path.starts_with(IMAGE_PATH_PREFIX) {
-            self.allows_image(model)
+            self.resolve_image(model)
         } else if path.starts_with(AUDIO_PATH_PREFIX) {
-            self.allows_audio(model)
+            self.resolve_audio(model)
         } else {
-            self.allows(model)
+            self.resolve_chat(model)
         }
     }
 
@@ -253,23 +292,33 @@ mod tests {
     /// The first audio id, the one the plan tries first.
     const AUD: &str = "mimo/mimo-v2.6-flash";
 
+    /// The gate an id passes on a route: the same rule the pass-through
+    /// applies, called here so the two cannot drift apart.
+    fn allows(a: &Allowlist, path: &str, model: &str) -> bool {
+        a.resolve_for_path(path, model).is_some()
+    }
+
     #[test]
     fn image_id_is_never_a_chat_model() {
         let a = Allowlist::parse(DEFAULT_MODELS).with_images(DEFAULT_IMAGE_MODELS);
         assert!(!a.allows(IMG));
-        assert!(a.allows_for_path("/v1/chat/completions", DEFAULT_MODELS));
-        assert!(!a.allows_for_path("/v1/chat/completions", IMG));
-        assert!(!a.allows_for_path(&format!("/v1/models/{IMG}"), IMG));
+        assert!(allows(&a, "/v1/chat/completions", DEFAULT_MODELS));
+        assert!(!allows(&a, "/v1/chat/completions", IMG));
+        assert!(!allows(&a, &format!("/v1/models/{IMG}"), IMG));
     }
 
     #[test]
     fn image_route_accepts_only_image_ids() {
         let a = Allowlist::parse(DEFAULT_MODELS).with_images(DEFAULT_IMAGE_MODELS);
-        assert!(a.allows_for_path("/v1/images/generations", IMG));
-        assert!(a.allows_for_path("/v1/images/generations", DEFAULT_IMAGE_MODELS));
+        assert!(allows(&a, "/v1/images/generations", IMG));
+        assert!(allows(&a, "/v1/images/generations", DEFAULT_IMAGE_MODELS));
         // A prefixed spelling of the same image model is not a second id.
-        assert!(!a.allows_for_path("/v1/images/generations", "cb/gemini-2.5-flash-image"));
-        assert!(!a.allows_for_path("/v1/images/generations", DEFAULT_MODELS));
+        assert!(!allows(
+            &a,
+            "/v1/images/generations",
+            "cb/gemini-2.5-flash-image"
+        ));
+        assert!(!allows(&a, "/v1/images/generations", DEFAULT_MODELS));
     }
 
     #[test]
@@ -288,7 +337,7 @@ mod tests {
     #[test]
     fn images_default_to_off() {
         let a = Allowlist::parse(DEFAULT_MODELS);
-        assert!(!a.allows_for_path("/v1/images/generations", IMG));
+        assert!(!allows(&a, "/v1/images/generations", IMG));
         assert_eq!(a.image_names(), "");
     }
 
@@ -299,7 +348,7 @@ mod tests {
             .with_audio(DEFAULT_AUDIO_MODELS);
         assert!(a.allows_audio(AUD));
         assert!(!a.allows(AUD));
-        assert!(!a.allows_for_path("/v1/chat/completions", AUD));
+        assert!(!allows(&a, "/v1/chat/completions", AUD));
         assert!(a.audio_plan_for(AUD).is_some());
         assert!(a.audio_plan_for(DEFAULT_MODELS).is_none());
     }
@@ -320,8 +369,8 @@ mod tests {
     #[test]
     fn audio_route_accepts_only_audio_ids() {
         let a = Allowlist::parse(DEFAULT_MODELS).with_audio(DEFAULT_AUDIO_MODELS);
-        assert!(a.allows_for_path("/v1/audio/transcriptions", AUD));
-        assert!(!a.allows_for_path("/v1/audio/transcriptions", DEFAULT_MODELS));
+        assert!(allows(&a, "/v1/audio/transcriptions", AUD));
+        assert!(!allows(&a, "/v1/audio/transcriptions", DEFAULT_MODELS));
     }
 
     /// What a client picks from is one id per capability: one chat id, one
@@ -361,5 +410,105 @@ mod tests {
     #[should_panic(expected = "must not overlap")]
     fn overlapping_image_and_chat_ids_are_a_config_error() {
         Allowlist::parse(DEFAULT_MODELS).with_images(DEFAULT_MODELS);
+    }
+
+    /// The id the docs publish for image generation is served on the id the
+    /// proxy carries, so a client built against those docs is served rather
+    /// than refused.
+    #[test]
+    fn the_published_image_id_resolves_to_the_served_image_id() {
+        let a = Allowlist::parse(DEFAULT_MODELS).with_images(DEFAULT_IMAGE_MODELS);
+        assert_eq!(
+            a.resolve_image("gemini-3.1-flash-image").as_deref(),
+            Some(IMG)
+        );
+        assert_eq!(a.resolve_image(IMG).as_deref(), Some(IMG));
+        // Resolution does not widen the list: the alias is not served under
+        // its own spelling, and `/v1/models` still carries one image id.
+        assert_eq!(a.image_names(), IMG, "the advertised list stays one id");
+    }
+
+    /// The id the docs publish for voice resolves to the head of the chain,
+    /// which is the leg `audio_plan_for` tries first.
+    #[test]
+    fn the_published_voice_id_resolves_to_the_head_of_the_chain() {
+        let a = Allowlist::parse(DEFAULT_MODELS).with_audio(DEFAULT_AUDIO_MODELS);
+        let resolved = a.resolve_audio("qwen3.8-omni-flash").unwrap();
+        assert_eq!(resolved, AUD);
+        assert_eq!(
+            a.audio_plan_for(&resolved).unwrap(),
+            vec!["mimo/mimo-v2.6-flash", "ocg/mimo-v2.6-flash"]
+        );
+    }
+
+    #[test]
+    fn an_alias_does_not_cross_capabilities() {
+        let a = Allowlist::parse(DEFAULT_MODELS)
+            .with_images(DEFAULT_IMAGE_MODELS)
+            .with_audio(DEFAULT_AUDIO_MODELS);
+        // Voice is not a chat model and not an image model, and the image id
+        // is not a voice id, whatever the caller names.
+        assert!(a.resolve_chat("qwen3.8-omni-flash").is_none());
+        assert!(a.resolve_chat("gemini-3.1-flash-image").is_none());
+        assert!(a.resolve_image("qwen3.8-omni-flash").is_none());
+        assert!(a.resolve_audio("gemini-3.1-flash-image").is_none());
+    }
+
+    #[test]
+    fn an_alias_resolves_to_nothing_when_the_capability_is_off() {
+        let a = Allowlist::parse(DEFAULT_MODELS);
+        assert!(a.resolve_image("gemini-3.1-flash-image").is_none());
+        assert!(a.resolve_audio("qwen3.8-omni-flash").is_none());
+    }
+
+    #[test]
+    fn an_unknown_id_is_still_refused() {
+        let a = Allowlist::parse(DEFAULT_MODELS)
+            .with_images(DEFAULT_IMAGE_MODELS)
+            .with_audio(DEFAULT_AUDIO_MODELS);
+        assert!(a.resolve_chat("gpt-4").is_none());
+        assert!(a.resolve_image("midjourney").is_none());
+        assert!(a.resolve_audio("whisper-1").is_none());
+        assert!(a.resolve_chat("").is_none());
+    }
+
+    /// A publisher-prefixed routing id is not an alias: it belongs in
+    /// `ROTATION_MODELS`, and a client naming one is refused as before.
+    #[test]
+    fn a_prefixed_routing_id_is_not_an_alias() {
+        let a = Allowlist::parse(DEFAULT_MODELS)
+            .with_images(DEFAULT_IMAGE_MODELS)
+            .with_audio(DEFAULT_AUDIO_MODELS);
+        assert!(a.resolve_image("cb/gemini-2.5-flash-image").is_none());
+        assert!(a.resolve_chat("cb/deepseek-v4.1-flash").is_none());
+        assert!(a.resolve_chat("ali/deepseek-v4.1-flash").is_none());
+        assert!(a.resolve_audio("ali/qwen3.8-omni-flash").is_none());
+    }
+
+    #[test]
+    fn resolve_for_path_picks_the_capability_of_the_route() {
+        let a = Allowlist::parse(DEFAULT_MODELS)
+            .with_images(DEFAULT_IMAGE_MODELS)
+            .with_audio(DEFAULT_AUDIO_MODELS);
+        assert_eq!(
+            a.resolve_for_path("/v1/images/generations", "gemini-3.1-flash-image")
+                .as_deref(),
+            Some(IMG)
+        );
+        assert_eq!(
+            a.resolve_for_path("/v1/audio/transcriptions", "qwen3.8-omni-flash")
+                .as_deref(),
+            Some(AUD)
+        );
+        assert_eq!(
+            a.resolve_for_path("/v1/chat/completions", DEFAULT_MODELS)
+                .as_deref(),
+            Some(DEFAULT_MODELS)
+        );
+        // The image id is not resolved on a chat route, so a chat request
+        // cannot be served by the image model through an alias.
+        assert!(a
+            .resolve_for_path("/v1/chat/completions", "gemini-3.1-flash-image")
+            .is_none());
     }
 }

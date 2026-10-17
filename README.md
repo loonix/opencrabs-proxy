@@ -15,11 +15,34 @@ Supported routes:
 
 - `POST /v1/chat/completions` (streaming and non-streaming, with token usage tracked)
 - `GET /v1/models` (non-chat models are filtered out)
-- `POST /v1/images/generations`, when `IMAGE_MODELS` is set. The body must name one of those ids, written exactly as the upstream lists it (`provider/model`); the proxy sends it on unchanged. Responses stream back as the upstream sends them
-- A chat request that carries an `input_audio` part is served only by `AUDIO_MODELS`, never by the chat list and never by a rotation candidate. A chat id is refused on such a request, and an audio id is refused on a request without audio, so a text prompt cannot be answered by a voice model and a voice note cannot be answered by a text one. When every audio id on the primary upstream fails, the voice-only `AUDIO_FALLBACK_*` upstream answers, if it is configured.
+- `POST /v1/images/generations`, when `IMAGE_MODELS` is set. The body names one of those ids, written exactly as the upstream lists it (`provider/model`), and the proxy sends it on unchanged. An id older docs published for image generation is served on the id set here: see [Ids older clients name](#ids-older-clients-name). Responses stream back as the upstream sends them
+- A chat request that carries an `input_audio` part is served only by `AUDIO_MODELS`, never by the chat list and never by a rotation candidate. A chat id is refused on such a request, and an audio id is refused on a request without audio, so a text prompt cannot be answered by a voice model and a voice note cannot be answered by a text one. When every audio id on the primary upstream fails, the voice-only `AUDIO_FALLBACK_*` upstream answers, if it is configured. An id older docs published for voice is served on the head of the chain: see [Ids older clients name](#ids-older-clients-name).
 - Any other `/v1/*` route (for example `/v1/responses`) is forwarded as-is. Usage is not read from those.
 
 A request without a valid token gets `401`. Unknown paths outside `/v1/` get `404`.
+
+### Ids older clients name
+
+The published OpenCrabs config and docs named `gemini-3.1-flash-image` for image
+generation and `qwen3.8-omni-flash` for voice. Neither is an id the upstream behind
+this proxy serves, so a client built against those docs would be refused. Each one
+is served on the id this proxy carries for the capability the route names:
+
+| A client names | Served as | On |
+|---|---|---|
+| `gemini-3.1-flash-image` | the `IMAGE_MODELS` id, `gemini-2.5-flash-image` by default | `/v1/images/*` |
+| `qwen3.8-omni-flash` | the head of the voice chain, `mimo/mimo-v2.6-flash` by default | a chat request carrying `input_audio`, and `/v1/audio/*` |
+
+Two rules hold:
+
+- An alias resolves only inside the capability it names, and only when this proxy
+  serves something for that capability. A voice id never resolves onto an image id,
+  and an empty `IMAGE_MODELS` keeps image generation off whatever the caller names.
+- An alias is accepted input, never advertised. `/v1/models` lists the served id, so
+  a picker fed from it still shows one id per capability.
+
+An id that is neither served nor an alias is refused with `403` before any upstream
+call. The table lives in `src/alias.rs`.
 
 ## Access model
 

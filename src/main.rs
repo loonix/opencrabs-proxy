@@ -13,6 +13,7 @@
 //! operator has to issue it by hand. It is mounted only when `INSTALL_PATH`
 //! names a path; unset leaves the route off. Usage is tracked per install label.
 
+mod alias;
 mod allowlist;
 mod audio;
 mod calibrate;
