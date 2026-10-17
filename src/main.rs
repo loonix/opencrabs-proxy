@@ -203,13 +203,13 @@ async fn main() {
         &std::env::var("IMAGE_MODELS")
             .unwrap_or_else(|_| allowlist::DEFAULT_IMAGE_MODELS.to_string()),
     );
-    let rotation = rotation::Rotation::parse(
-        std::env::var("ROTATION_MODELS").ok().as_deref(),
-        &allowed_raw,
-    );
+    let rotation = rotation::Rotation::parse(std::env::var("ROTATION_MODELS").ok().as_deref());
     let rotation_names = rotation.names();
     let rotation_secs = rotation.attempt_timeout().as_secs();
-    let probe_models = probe::models_from_env(rotation.candidates());
+    // The probe falls back to the rotation candidates, and to the allowlist
+    // when rotation is off, so an unconfigured proxy still probes the model it
+    // actually serves instead of probing nothing.
+    let probe_models = probe::models_from_env(rotation.candidates(), allow.chat_candidates());
 
     let models_list = allow.names();
     let images_list = allow.image_names();

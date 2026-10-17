@@ -3,9 +3,16 @@
 //! When the model a request landed on dies (transport error, no response
 //! headers within the per-attempt timeout, or an upstream 5xx), the proxy can
 //! retry the same request on the next candidate model instead of feeding the
-//! caller the upstream's error body. Candidates come from `ROTATION_MODELS`
-//! (comma list) and default to the `ALLOWED_MODELS` list, so a proxy with one
-//! enabled model gets a single-attempt plan and rotation is a no-op.
+//! caller the upstream's error body. Candidates come only from
+//! `ROTATION_MODELS`, an explicit comma list: with the variable unset the plan
+//! is a single attempt on the model the caller named, so nothing is ever
+//! swapped in behind the caller's back.
+//!
+//! The list is never derived from `ALLOWED_MODELS`. The two answer different
+//! questions: the allowlist is every id a caller may name, and rotation is the
+//! set that is safe to serve a text request on. Deriving the second from the
+//! first puts audio-only and image ids into the fallback chain, and an audio
+//! or image request that rotates lands on a model that cannot answer it.
 //!
 //! The requested model always tries first, even when the configured list
 //! starts elsewhere. A plan holds at most [`MAX_ATTEMPTS`] candidates, and
@@ -32,7 +39,10 @@ pub const DEFAULT_TTFT_MAX_BODY_BYTES: usize = 524_288;
 
 #[derive(Clone, Debug)]
 pub struct Rotation {
-    models: Vec<String>,
+    /// The explicit rotation list. `None` means `ROTATION_MODELS` was unset or
+    /// blank, so there is nothing to rotate to and a request gets a single
+    /// attempt on the model it named.
+    models: Option<Vec<String>>,
     attempt_timeout: Duration,
     ttft_max_body_bytes: usize,
 }
@@ -46,7 +56,7 @@ pub struct Rotation {
 /// wait with nothing to fall back to.
 #[derive(Serialize, Clone, Debug, Default)]
 pub struct RotationSummary {
-    /// Comma-joined configured candidates, in order.
+    /// Comma-joined configured candidates, in order. Empty when rotation is off.
     pub names: String,
     /// Candidates one request may use, capped at [`MAX_ATTEMPTS`].
     pub plan_len: u64,
@@ -75,17 +85,14 @@ fn attempt_timeout(raw: Option<&str>) -> Duration {
 }
 
 impl Rotation {
-    /// `rotation_raw` is the `ROTATION_MODELS` value; `None` or a blank value
-    /// means "the same ids as the allowlist". `allowlist` is the already
-    /// resolved `ALLOWED_MODELS` string. Panics when the effective list is
-    /// empty, matching `Allowlist::parse`: a proxy that can serve nothing is
-    /// a config error and should refuse to start.
-    pub fn parse(rotation_raw: Option<&str>, allowlist: &str) -> Self {
+    /// `rotation_raw` is the `ROTATION_MODELS` value. `None` or a blank value
+    /// means rotation is off: a request gets a single attempt on the model the
+    /// caller named, and no other id is ever substituted for it.
+    pub fn parse(rotation_raw: Option<&str>) -> Self {
         let models = match rotation_raw.map(split_ids) {
-            Some(ids) if !ids.is_empty() => ids,
-            _ => split_ids(allowlist),
+            Some(ids) if !ids.is_empty() => Some(ids),
+            _ => None,
         };
-        assert!(!models.is_empty(), "rotation candidate list is empty");
         let attempt_timeout = attempt_timeout(
             std::env::var("ROTATION_ATTEMPT_TIMEOUT_SECS")
                 .ok()
@@ -107,19 +114,26 @@ impl Rotation {
         self.attempt_timeout
     }
 
-    /// Comma-joined candidates, for startup logs.
+    /// Comma-joined candidates, for startup logs. Empty when rotation is off.
     pub fn names(&self) -> String {
-        self.models.join(",")
+        self.models
+            .as_deref()
+            .map(|ids| ids.join(","))
+            .unwrap_or_default()
     }
 
-    /// The configured candidates, in order.
+    /// The configured candidates, in order. Empty when rotation is off.
     pub fn candidates(&self) -> &[String] {
-        &self.models
+        self.models.as_deref().unwrap_or(&[])
     }
 
     /// The configured rotation, for `/stats` and the startup log.
     pub fn summary(&self) -> RotationSummary {
-        let plan_len = self.models.len().min(MAX_ATTEMPTS) as u64;
+        // Off means one attempt on the requested model, which is a plan of one.
+        let plan_len = match self.models.as_deref() {
+            Some(ids) => ids.len().min(MAX_ATTEMPTS) as u64,
+            None => 1,
+        };
         RotationSummary {
             names: self.names(),
             plan_len,
@@ -132,7 +146,7 @@ impl Rotation {
     #[cfg(test)]
     pub fn for_tests(models: &[&str], attempt_timeout: Duration) -> Self {
         Self {
-            models: models.iter().map(|s| s.to_string()).collect(),
+            models: Some(models.iter().map(|s| s.to_string()).collect()),
             attempt_timeout,
             ttft_max_body_bytes: DEFAULT_TTFT_MAX_BODY_BYTES,
         }
@@ -161,7 +175,7 @@ impl Rotation {
     /// explicit `ROTATION_MODELS` list is used verbatim. That matters when
     /// the list carries provider-prefixed ids the client never sends: a bare
     /// client id must not be injected ahead of them. An empty requested id
-    /// is skipped.
+    /// is skipped. With rotation off the plan is the requested id alone.
     pub fn plan_for(&self, requested: &str) -> Vec<String> {
         let mut plan: Vec<String> = Vec::with_capacity(MAX_ATTEMPTS);
         let mut push = |id: &str| {
@@ -169,10 +183,16 @@ impl Rotation {
                 plan.push(id.to_string());
             }
         };
-        if self.models.iter().any(|m| m == requested) {
+        let Some(models) = self.models.as_deref() else {
+            // Rotation off: the caller's model is the whole plan, and a model
+            // the caller never named is never substituted for it.
+            push(requested);
+            return plan;
+        };
+        if models.iter().any(|m| m == requested) {
             push(requested);
         }
-        for id in &self.models {
+        for id in models {
             push(id);
         }
         plan
@@ -183,56 +203,69 @@ impl Rotation {
 mod tests {
     use super::*;
 
+    /// Unset `ROTATION_MODELS` means one attempt on the model the caller
+    /// named. With the shipped allowlist that single candidate is its only
+    /// entry, so an unconfigured proxy serves exactly one model and never
+    /// substitutes another for it.
     #[test]
-    fn defaults_to_the_allowlist_and_is_a_noop_for_one_model() {
-        let r = Rotation::parse(None, "deepseek-v4.1-flash");
+    fn unset_rotation_is_a_single_candidate_on_the_requested_model() {
+        let only_allowed = crate::allowlist::DEFAULT_MODELS;
+        let r = Rotation::parse(None);
+        let plan = r.plan_for(only_allowed);
+        assert_eq!(plan, vec![only_allowed]);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(r.candidates(), &[] as &[String]);
+        assert_eq!(r.summary().plan_len, 1);
+        assert!(!r.summary().engaging);
+    }
+
+    /// The allowlist is not a rotation list: an audio-only id that a caller
+    /// may name must never be picked up as a text fallback.
+    #[test]
+    fn rotation_never_derives_candidates_from_the_allowlist() {
+        let r = Rotation::parse(None);
         assert_eq!(
-            r.plan_for("deepseek-v4.1-flash"),
-            vec!["deepseek-v4.1-flash"]
+            r.plan_for("mimo/mimo-v2.6-flash"),
+            vec!["mimo/mimo-v2.6-flash"]
         );
     }
 
     #[test]
     fn explicit_list_is_used_verbatim_ignoring_the_requested_id() {
-        let r = Rotation::parse(Some("b-model,c-model"), "a-model");
+        let r = Rotation::parse(Some("b-model,c-model"));
         assert_eq!(r.plan_for("a-model"), vec!["b-model", "c-model"]);
     }
 
     #[test]
     fn requested_inside_the_list_stays_first() {
-        let r = Rotation::parse(Some("b-model,a-model,c-model"), "a-model");
+        let r = Rotation::parse(Some("b-model,a-model,c-model"));
         assert_eq!(r.plan_for("a-model"), vec!["a-model", "b-model", "c-model"]);
     }
 
     #[test]
     fn configured_candidates_follow_in_order_without_duplicates() {
-        let r = Rotation::parse(Some("a-model,b-model,a-model,b-model"), "x");
+        let r = Rotation::parse(Some("a-model,b-model,a-model,b-model"));
         assert_eq!(r.plan_for("b-model"), vec!["b-model", "a-model"]);
     }
 
     #[test]
     fn plan_is_capped_at_max_attempts() {
-        let r = Rotation::parse(Some("m1,m2,m3,m4,m5"), "x");
+        let r = Rotation::parse(Some("m1,m2,m3,m4,m5"));
         assert_eq!(r.plan_for("req"), vec!["m1", "m2", "m3"]);
         assert_eq!(r.plan_for("").len(), MAX_ATTEMPTS);
     }
 
     #[test]
     fn empty_requested_id_is_skipped() {
-        let r = Rotation::parse(Some("m1,m2,m3,m4"), "x");
+        let r = Rotation::parse(Some("m1,m2,m3,m4"));
         assert_eq!(r.plan_for(""), vec!["m1", "m2", "m3"]);
     }
 
     #[test]
-    fn blank_rotation_value_falls_back_to_allowlist() {
-        let r = Rotation::parse(Some(" , "), "fallback-model");
+    fn blank_rotation_value_turns_rotation_off() {
+        let r = Rotation::parse(Some(" , "));
         assert_eq!(r.plan_for("fallback-model"), vec!["fallback-model"]);
-    }
-
-    #[test]
-    #[should_panic(expected = "rotation candidate list is empty")]
-    fn empty_effective_list_is_a_config_error() {
-        Rotation::parse(Some(" , "), " , ");
+        assert_eq!(r.summary().plan_len, 1);
     }
 
     #[test]
@@ -247,7 +280,7 @@ mod tests {
     #[test]
     fn summary_reports_whether_rotation_can_engage() {
         // One candidate: rotation is a no-op and the summary must say so.
-        let one = Rotation::parse(Some("combo/cheapest"), "x").summary();
+        let one = Rotation::parse(Some("combo/cheapest")).summary();
         assert_eq!(one.plan_len, 1);
         assert!(!one.engaging);
         assert_eq!(one.names, "combo/cheapest");
@@ -259,14 +292,14 @@ mod tests {
         assert_eq!(three.attempt_timeout_secs, 40);
 
         // Five configured, three usable: the cap is what a request gets.
-        let capped = Rotation::parse(Some("a,b,c,d,e"), "x").summary();
+        let capped = Rotation::parse(Some("a,b,c,d,e")).summary();
         assert_eq!(capped.plan_len, MAX_ATTEMPTS as u64);
         assert!(capped.engaging);
     }
 
     #[test]
     fn first_byte_budget_applies_to_small_streaming_requests_only() {
-        let r = Rotation::parse(None, "m1");
+        let r = Rotation::parse(None);
         // Small streaming request: first-token trigger on.
         assert_eq!(
             r.first_byte_budget(4_096, true),

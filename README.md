@@ -44,16 +44,16 @@ Set these in the environment. Required values stop the process at startup if mis
 | `TOKENS_FILE` | yes | Issued caller token hashes |
 | `BIND_ADDR` | no | Default `127.0.0.1:8787` |
 | `RATE_MAX_PER_MIN` | no | Default 60 per caller |
-| `ALLOWED_MODELS` | no | Comma list of chat model ids this proxy serves. Default `deepseek-v4.1-flash`. Any other id is refused before the upstream call, and `/v1/models` lists only these |
+| `ALLOWED_MODELS` | no | Comma list of chat model ids this proxy serves. Default `cb/deepseek-v4.1-flash`. Ids are written exactly as the upstream lists them, `provider/model`, and are sent on unchanged: a bare id is not an alias for a prefixed one. Any other id is refused before the upstream call, and `/v1/models` lists only these |
 | `IMAGE_MODELS` | no | Comma list of image generation ids, served only on `/v1/images/*`. Default `cb/gemini-2.5-flash-image`. Ids are written exactly as the upstream lists them, `provider/model`, and are sent on unchanged: the proxy never adds or strips a prefix. Empty turns image generation off. An id may not also appear in `ALLOWED_MODELS` |
 | `STATS_DB` | no | SQLite path for usage rows |
 | `VISION_SWAP` | no | Off by default. Routes image requests to `DEFAULT_VISION_MODEL` in `src/vision.rs`. Only enable it for an upstream that serves that model |
-| `ROTATION_MODELS` | no | Comma list of chat model ids to try in order when one fails. Defaults to `ALLOWED_MODELS`, so a single-model proxy never rotates |
+| `ROTATION_MODELS` | no | Comma list of chat model ids to try in order when one fails. Unset means rotation is off: one attempt on the model the caller named. It is never derived from `ALLOWED_MODELS`, because the allowlist is what a caller may name and rotation is what is safe to serve a text request on, so an audio-only or image id must never become a fallback |
 | `ROTATION_ATTEMPT_TIMEOUT_SECS` | no | Default 15. Budget for response headers, and for the first SSE byte on small streaming requests |
 | `ROTATION_TTFT_MAX_BODY_BYTES` | no | Default 524288. Request bodies at or above this size are compaction-scale and are exempt from the first-token budget |
 | `PROBE_INTERVAL_SECS` | no | Default 300. How often the upstream health probe runs. A value of zero falls back to the default rather than disabling the probe |
 | `PROBE_TIMEOUT_SECS` | no | Default 40. Ceiling on a single probe request |
-| `PROBE_MODELS` | no | Comma list to probe. Defaults to every `ROTATION_MODELS` candidate |
+| `PROBE_MODELS` | no | Comma list to probe. Defaults to every `ROTATION_MODELS` candidate, and to `ALLOWED_MODELS` when rotation is off |
 | `MAX_INPUT_TOKENS` | no | Default 200000. A request whose calibrated estimated input reaches this is refused with `413` before any upstream call. `0` disables it. Global: one value for every caller |
 | `INSTALL_PATH` | no | Path the install route is mounted at. Unset means the route is not registered at all. Must start with `/` |
 | `INSTALL_RATE_PER_DAY` | no | Default 5000. Install-route requests per client IP per day |
@@ -190,12 +190,15 @@ is enough to hang every caller whose request lands on it.
 
 Chat requests can survive a dying model. The proxy tries the requested model
 first, then the remaining candidates from `ROTATION_MODELS`, at most three
-attempts. A candidate counts as failed when the connection dies, when no
-response headers arrive inside `ROTATION_ATTEMPT_TIMEOUT_SECS`, when a small
-streaming request produces no first SSE byte inside that same budget, or when
-the upstream answers 5xx. A 4xx is never retried: it is the upstream speaking
-for that exact request. When every candidate fails with 5xx, the last upstream
-error body is relayed; when every candidate is dead, the proxy answers 502
+attempts. Rotation is off unless `ROTATION_MODELS` is set, so a proxy with the
+variable unset serves one attempt on the model the caller named and never
+substitutes another. A candidate counts as failed when the connection dies,
+when no response headers arrive inside `ROTATION_ATTEMPT_TIMEOUT_SECS`, when a
+small streaming request produces no first SSE byte inside that same budget, or
+when the upstream answers 5xx. A 4xx is never retried: it is the upstream
+speaking for that exact request. When every candidate fails with 5xx, the last
+upstream error body is relayed; when every candidate is dead, the proxy
+answers 502
 itself.
 
 Every served response carries an `x-keyproxy-model` header naming the model

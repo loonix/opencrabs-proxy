@@ -58,22 +58,26 @@ fn timeout_from(raw: Option<&str>) -> Duration {
 }
 
 /// Which models to probe, from `PROBE_MODELS` when set, otherwise every
-/// configured rotation candidate.
+/// configured rotation candidate, and the allowlist when rotation is off.
 ///
 /// Probing the rotation list is the point: the diagnostic that matters is
 /// "candidate A is hung and candidate B answers in two seconds", which is
-/// invisible if only one of them is ever exercised.
-pub fn models_from_env(rotation_names: &[String]) -> Vec<String> {
+/// invisible if only one of them is ever exercised. Rotation off means there is
+/// no such comparison to make, so the allowlist stands in and the proxy still
+/// probes the models it actually serves.
+pub fn models_from_env(rotation_names: &[String], allowlist: &[String]) -> Vec<String> {
     models_from(
         std::env::var("PROBE_MODELS").ok().as_deref(),
         rotation_names,
+        allowlist,
     )
 }
 
 /// The parsing behind [`models_from_env`]. Pure, for the same reason as
 /// [`interval_from`]. A blank or all-separator value falls back to the
-/// rotation rather than leaving the probe with nothing to check.
-fn models_from(raw: Option<&str>, rotation_names: &[String]) -> Vec<String> {
+/// rotation, then to the allowlist, rather than leaving the probe with nothing
+/// to check.
+fn models_from(raw: Option<&str>, rotation_names: &[String], allowlist: &[String]) -> Vec<String> {
     if let Some(raw) = raw {
         let listed: Vec<String> = raw
             .split(',')
@@ -83,6 +87,9 @@ fn models_from(raw: Option<&str>, rotation_names: &[String]) -> Vec<String> {
         if !listed.is_empty() {
             return listed;
         }
+    }
+    if rotation_names.is_empty() {
+        return allowlist.to_vec();
     }
     rotation_names.to_vec()
 }
@@ -252,23 +259,41 @@ mod tests {
         ]
     }
 
+    fn allowlist() -> Vec<String> {
+        vec!["cb/deepseek-v4.1-flash".to_string()]
+    }
+
     #[test]
     fn probe_models_default_to_the_rotation_candidates() {
         // Unset PROBE_MODELS means the rotation list is what gets probed.
-        assert_eq!(models_from(None, &rotation()), rotation());
+        assert_eq!(models_from(None, &rotation(), &allowlist()), rotation());
+    }
+
+    #[test]
+    fn probe_models_fall_back_to_the_allowlist_when_rotation_is_off() {
+        // Rotation off leaves no candidates to compare, so the probe checks
+        // the models the proxy actually serves.
+        assert_eq!(models_from(None, &[], &allowlist()), allowlist());
+        assert_eq!(models_from(Some("  "), &[], &allowlist()), allowlist());
     }
 
     #[test]
     fn probe_models_env_overrides_the_rotation_candidates() {
         // Separators and blanks around the ids are trimmed away.
         assert_eq!(
-            models_from(Some("a, b ,,c"), &rotation()),
+            models_from(Some("a, b ,,c"), &rotation(), &allowlist()),
             vec!["a", "b", "c"]
         );
         // A blank list must not disable the probe: fall back to the rotation.
-        assert_eq!(models_from(Some("  "), &rotation()), rotation());
-        assert_eq!(models_from(Some(""), &rotation()), rotation());
-        assert_eq!(models_from(Some(" , ,"), &rotation()), rotation());
+        assert_eq!(
+            models_from(Some("  "), &rotation(), &allowlist()),
+            rotation()
+        );
+        assert_eq!(models_from(Some(""), &rotation(), &allowlist()), rotation());
+        assert_eq!(
+            models_from(Some(" , ,"), &rotation(), &allowlist()),
+            rotation()
+        );
     }
 
     #[test]

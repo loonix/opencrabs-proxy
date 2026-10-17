@@ -13,7 +13,11 @@ use axum::{
 };
 use serde_json::{json, Value};
 
-pub const DEFAULT_MODELS: &str = "deepseek-v4.1-flash";
+/// Default chat ids served on `/v1/chat/completions`. Written the way the
+/// upstream lists them, `provider/model`, and sent on unchanged: the proxy
+/// never adds or strips a prefix, and a bare id is not an alias for a
+/// prefixed one. Set with `ALLOWED_MODELS`.
+pub const DEFAULT_MODELS: &str = "cb/deepseek-v4.1-flash";
 
 /// Image generation ids served on `/v1/images/*` only. Each id is written the
 /// way the upstream lists it, `provider/model`, and is sent on unchanged: the
@@ -65,6 +69,12 @@ impl Allowlist {
 
     pub fn names(&self) -> String {
         self.models.join(",")
+    }
+
+    /// The chat ids, in configured order. Used where a slice is needed rather
+    /// than the joined string, such as the health probe's fallback targets.
+    pub fn chat_candidates(&self) -> &[String] {
+        &self.models
     }
 
     pub fn image_names(&self) -> String {
@@ -130,8 +140,9 @@ mod tests {
     #[test]
     fn default_allows_only_flash() {
         let a = Allowlist::parse(DEFAULT_MODELS);
-        assert!(a.allows("deepseek-v4.1-flash"));
-        assert!(!a.allows("deepseek-v4.1-pro"));
+        assert!(a.allows("cb/deepseek-v4.1-flash"));
+        assert!(!a.allows("deepseek-v4.1-flash"));
+        assert!(!a.allows("cb/deepseek-v4.1-pro"));
         assert!(!a.allows(""));
     }
 
@@ -147,6 +158,7 @@ mod tests {
         let mut v = json!({"object": "list", "data": [
             {"id": "deepseek-v4.1-flash"},
             {"id": "ali/deepseek-v4.1-flash"},
+            {"id": "cb/deepseek-v4.1-flash"},
             {"id": "gpt-x"},
         ]});
         a.filter_models(&mut v);
@@ -156,7 +168,7 @@ mod tests {
             .iter()
             .map(|m| m["id"].as_str().unwrap())
             .collect();
-        assert_eq!(ids, vec!["deepseek-v4.1-flash"]);
+        assert_eq!(ids, vec!["cb/deepseek-v4.1-flash"]);
     }
 
     #[test]
@@ -171,7 +183,7 @@ mod tests {
     fn image_id_is_never_a_chat_model() {
         let a = Allowlist::parse(DEFAULT_MODELS).with_images(DEFAULT_IMAGE_MODELS);
         assert!(!a.allows(DEFAULT_IMAGE_MODELS));
-        assert!(a.allows_for_path("/v1/chat/completions", "deepseek-v4.1-flash"));
+        assert!(a.allows_for_path("/v1/chat/completions", DEFAULT_MODELS));
         assert!(!a.allows_for_path("/v1/chat/completions", DEFAULT_IMAGE_MODELS));
         assert!(!a.allows_for_path(
             &format!("/v1/models/{DEFAULT_IMAGE_MODELS}"),
@@ -183,14 +195,14 @@ mod tests {
     fn image_route_accepts_only_image_ids() {
         let a = Allowlist::parse(DEFAULT_MODELS).with_images(DEFAULT_IMAGE_MODELS);
         assert!(a.allows_for_path("/v1/images/generations", DEFAULT_IMAGE_MODELS));
-        assert!(!a.allows_for_path("/v1/images/generations", "deepseek-v4.1-flash"));
+        assert!(!a.allows_for_path("/v1/images/generations", DEFAULT_MODELS));
     }
 
     #[test]
     fn image_list_is_not_listed_as_chat_models() {
         let a = Allowlist::parse(DEFAULT_MODELS).with_images(DEFAULT_IMAGE_MODELS);
         let mut v = json!({"object": "list", "data": [
-            {"id": "deepseek-v4.1-flash"},
+            {"id": DEFAULT_MODELS},
             {"id": DEFAULT_IMAGE_MODELS},
         ]});
         a.filter_models(&mut v);
@@ -208,6 +220,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "must not overlap")]
     fn overlapping_image_and_chat_ids_are_a_config_error() {
-        Allowlist::parse(DEFAULT_MODELS).with_images("deepseek-v4.1-flash");
+        Allowlist::parse(DEFAULT_MODELS).with_images("cb/deepseek-v4.1-flash");
     }
 }
