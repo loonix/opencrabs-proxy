@@ -16,7 +16,7 @@ Supported routes:
 - `POST /v1/chat/completions` (streaming and non-streaming, with token usage tracked)
 - `GET /v1/models` (non-chat models are filtered out)
 - `POST /v1/images/generations`, when `IMAGE_MODELS` is set. The body must name one of those ids, written exactly as the upstream lists it (`provider/model`); the proxy sends it on unchanged. Responses stream back as the upstream sends them
-- A chat request that carries an `input_audio` part is served only by `AUDIO_MODELS`, never by the chat list and never by a rotation candidate. A chat id is refused on such a request, and an audio id is refused on a request without audio, so a text prompt cannot be answered by a voice model and a voice note cannot be answered by a text one.
+- A chat request that carries an `input_audio` part is served only by `AUDIO_MODELS`, never by the chat list and never by a rotation candidate. A chat id is refused on such a request, and an audio id is refused on a request without audio, so a text prompt cannot be answered by a voice model and a voice note cannot be answered by a text one. When every audio id on the primary upstream fails, the voice-only `AUDIO_FALLBACK_*` upstream answers, if it is configured.
 - Any other `/v1/*` route (for example `/v1/responses`) is forwarded as-is. Usage is not read from those.
 
 A request without a valid token gets `401`. Unknown paths outside `/v1/` get `404`.
@@ -48,6 +48,9 @@ Set these in the environment. Required values stop the process at startup if mis
 | `ALLOWED_MODELS` | no | Comma list of chat model ids this proxy serves. Default `cb/deepseek-v4.1-flash`. Ids are written exactly as the upstream lists them, `provider/model`, and are sent on unchanged: a bare id is not an alias for a prefixed one. Any other id is refused before the upstream call, and `/v1/models` lists only these |
 | `IMAGE_MODELS` | no | Comma list of image generation ids, served only on `/v1/images/*`. Default `cb/gemini-2.5-flash-image,gemini-2.5-flash-image`. Ids are written exactly as the upstream lists them, `provider/model`, and are sent on unchanged: the proxy never adds or strips a prefix. Empty turns image generation off. An id may not also appear in `ALLOWED_MODELS` |
 | `AUDIO_MODELS` | no | Comma list of audio input ids, served only when a chat request carries an `input_audio` part, and only on `/v1/audio/*`. Default `mimo/mimo-v2.6-flash`. The first id is tried first and the rest are fallbacks in order. An id here is never a chat model, so a text prompt cannot be answered by a voice model, and a chat id is refused on an audio request. An id may not also appear in `ALLOWED_MODELS` or `IMAGE_MODELS` |
+| `AUDIO_FALLBACK_BASE_URL` | no | Base URL of a second upstream used for voice only, after every `AUDIO_MODELS` id on the primary upstream fails. Never consulted for a text request |
+| `AUDIO_FALLBACK_API_KEY` | no | Key for the voice fallback upstream |
+| `AUDIO_FALLBACK_MODELS` | no | Comma list of ids tried in order on the voice fallback upstream. The three `AUDIO_FALLBACK_*` variables are set together or not at all: a partial set stops the process at startup rather than leaving voice without the second leg it was promised |
 | `STATS_DB` | no | SQLite path for usage rows |
 | `VISION_SWAP` | no | Off by default. Routes image requests to `DEFAULT_VISION_MODEL` in `src/vision.rs`. Only enable it for an upstream that serves that model |
 | `ROTATION_MODELS` | no | Comma list of chat model ids to try in order when one fails. Unset means rotation is off: one attempt on the model the caller named. It is never derived from `ALLOWED_MODELS`, because the allowlist is what a caller may name and rotation is what is safe to serve a text request on, so an audio-only or image id must never become a fallback |

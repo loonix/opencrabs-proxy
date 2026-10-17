@@ -14,6 +14,7 @@
 //! names a path; unset leaves the route off. Usage is tracked per install label.
 
 mod allowlist;
+mod audio;
 mod calibrate;
 mod caps;
 mod guard;
@@ -52,6 +53,8 @@ pub struct AppState {
     tokens_path: String,
     vision_swap: bool,
     allow: allowlist::Allowlist,
+    /// The voice-only second upstream. Unset leaves audio with one leg.
+    audio_fallback: Option<audio::AudioFallback>,
     rotation: rotation::Rotation,
     upstream: String,
     rate: rate::RateLimiter<String>,
@@ -212,6 +215,9 @@ async fn main() {
             &std::env::var("AUDIO_MODELS")
                 .unwrap_or_else(|_| allowlist::DEFAULT_AUDIO_MODELS.to_string()),
         );
+    // Voice-only second leg. All three variables or none: a partial set stops
+    // the process rather than promising a fallback that is not there.
+    let audio_fallback = audio::AudioFallback::from_env();
     let rotation = rotation::Rotation::parse(std::env::var("ROTATION_MODELS").ok().as_deref());
     let rotation_names = rotation.names();
     let rotation_secs = rotation.attempt_timeout().as_secs();
@@ -223,6 +229,10 @@ async fn main() {
     let models_list = allow.names();
     let images_list = allow.image_names();
     let audio_list = allow.audio_names();
+    let fallback_note = match &audio_fallback {
+        Some(f) => format!("[{}]", f.describe()),
+        None => "off".to_string(),
+    };
     let caps = caps::Caps::from_env();
     let limit = limit::InputLimit::from_env();
     let input_ceiling = if limit.enabled() {
@@ -256,6 +266,7 @@ async fn main() {
         tokens_path,
         vision_swap,
         allow,
+        audio_fallback,
         rotation,
         upstream: upstream.clone(),
         rate: rate::RateLimiter::new(rate_max, Duration::from_secs(60)),
@@ -295,7 +306,7 @@ async fn main() {
         .await
         .unwrap_or_else(|e| panic!("bind {bind}: {e}"));
     tracing::info!(
-        "keyproxy listening on {bind} (upstream {upstream}, rate {rate_max}/min per caller, vision_swap {vision_swap}, models {models_list}, image models {images_list}, audio models {audio_list}, stats {stats_db}, caps {:?}, input ceiling {input_ceiling}, calibration {calibration_note}, body limit {} MB, install route {install_note}, rotation [{rotation_names}] at {rotation_secs}s per attempt, keys [{key_labels}] active `{active_key}` floor {min_balance})",
+        "keyproxy listening on {bind} (upstream {upstream}, rate {rate_max}/min per caller, vision_swap {vision_swap}, models {models_list}, image models {images_list}, audio models {audio_list}, voice fallback {fallback_note}, stats {stats_db}, caps {:?}, input ceiling {input_ceiling}, calibration {calibration_note}, body limit {} MB, install route {install_note}, rotation [{rotation_names}] at {rotation_secs}s per attempt, keys [{key_labels}] active `{active_key}` floor {min_balance})",
         caps,
         limit::MAX_BODY_BYTES / (1024 * 1024),
     );

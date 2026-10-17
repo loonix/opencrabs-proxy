@@ -17,6 +17,10 @@ use crate::{
 /// Label stored when a request never reached a caller (no or bad token).
 const NO_CALLER: &str = "-";
 
+/// Label stored as the key of a request the voice fallback answered. The
+/// fallback has its own credential, so the primary key labels would lie.
+const AUDIO_FALLBACK_LABEL: &str = "audio-fallback";
+
 /// Why a request never reached a model, as stored in `failure_reason`. Every
 /// non-2xx gets a reason so a report can account for all of them instead of
 /// leaving a bucket of anonymous errors.
@@ -52,6 +56,49 @@ fn carries_audio(body: &serde_json::Value) -> bool {
                     .is_some_and(|parts| parts.iter().any(|p| p.get("input_audio").is_some()))
             })
         })
+}
+
+/// The voice-only second leg.
+///
+/// Called only for a request that carries audio, and only after the primary
+/// upstream produced no answer. Text requests never reach it, so a chat prompt
+/// cannot be sent to a provider that was configured for voice.
+///
+/// Tries each fallback model in order on the fallback upstream's own key. The
+/// first answer below 400 wins; anything else is logged and the next model is
+/// tried. `None` means the primary's own error is the one to relay.
+async fn audio_fallback(
+    state: &AppState,
+    body_json: &mut serde_json::Value,
+    start: Instant,
+) -> Option<(String, proxy::ForwardResult)> {
+    let fallback = state.audio_fallback.as_ref()?;
+    let url = fallback.chat_url();
+    let policy = proxy::AttemptPolicy::header_only(state.rotation.attempt_timeout());
+    for model in &fallback.models {
+        body_json["model"] = serde_json::Value::String(model.clone());
+        let req = state
+            .client
+            .post(&url)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body_json.to_string());
+        match proxy::send_attempt_with(fallback.key(), policy, req).await {
+            proxy::Attempt::Ok(upstream) => {
+                let forwarded = proxy::forward_response(upstream, start).await;
+                if forwarded.status < 400 {
+                    return Some((model.clone(), forwarded));
+                }
+                tracing::warn!("audio fallback: `{model}` upstream {}", forwarded.status);
+            }
+            proxy::Attempt::ServerError(upstream) => {
+                tracing::warn!("audio fallback: `{model}` upstream {}", upstream.status);
+            }
+            proxy::Attempt::Dead(failure) => {
+                tracing::warn!("audio fallback: `{model}` dead: {}", failure.detail);
+            }
+        }
+    }
+    None
 }
 
 /// Record and answer a request for a model the allowlist does not serve.
@@ -293,6 +340,25 @@ pub async fn chat_completions(
             break 'plan;
         }
     }
+    // Voice-only second leg. Reached only by a request that carries audio,
+    // and only when the primary produced no answer: every audio candidate was
+    // dead or 5xx, or the primary rejected the request outright. A successful
+    // fallback replaces the primary result; a failed one leaves the primary's
+    // own error to be relayed.
+    let primary_failed = match &result {
+        Some(forwarded) => forwarded.status >= 400,
+        None => true,
+    };
+    if is_audio && primary_failed {
+        if let Some((model, forwarded)) = audio_fallback(&state, &mut body_json, start).await {
+            tracing::warn!("audio fallback: served `{model}` after the primary failed");
+            served = Some(model);
+            served_index = None;
+            key_label = AUDIO_FALLBACK_LABEL.to_string();
+            result = Some(forwarded);
+        }
+    }
+
     let mut result = match (result, last_error) {
         (Some(result), _) => result,
         // Every candidate answered 5xx: relay the last upstream error body.
@@ -773,6 +839,26 @@ mod rotation_tests {
         .await
     }
 
+    /// The same app with a voice fallback pointing at a second upstream, so a
+    /// test can watch which leg answered.
+    async fn test_app_with_fallback(
+        upstream: SocketAddr,
+        fallback: SocketAddr,
+        models: &[&str],
+        fallback_models: &[&str],
+    ) -> TestApp {
+        let mut app = test_app(upstream, models, Duration::from_secs(5)).await;
+        let base_url = format!("http://{fallback}");
+        let joined = fallback_models.join(",");
+        let state = Arc::get_mut(&mut app.state).expect("state is freshly built");
+        state.audio_fallback = crate::audio::AudioFallback::from_values(
+            Some(&base_url),
+            Some("fallback-key"),
+            Some(&joined),
+        );
+        app
+    }
+
     /// The same app with an input ceiling of its own, so a refusal test does not
     /// have to build a 200k-token body to reach the wall.
     async fn test_app_with_limit(
@@ -801,6 +887,7 @@ mod rotation_tests {
             // Chat ids m1/m2, audio ids a1/a2. The two lists never overlap,
             // which is what keeps a voice note off a text model.
             allow: Allowlist::parse("m1,m2").with_audio("a1,a2"),
+            audio_fallback: None,
             rotation: rotation::Rotation::for_tests(models, attempt_timeout),
             upstream: format!("http://{upstream}"),
             rate: rate::RateLimiter::new(10_000, Duration::from_secs(60)),
@@ -1082,6 +1169,62 @@ mod rotation_tests {
         assert_eq!(row.attempts, Some(2));
         assert_eq!(row.plan_len, Some(2));
         assert_eq!(row.served_index, Some(1));
+    }
+
+    /// When every audio model on the primary upstream fails, the voice
+    /// fallback answers. The fallback is a separate upstream with its own key,
+    /// and the row says so instead of borrowing a primary key label.
+    #[tokio::test]
+    async fn a_voice_request_falls_back_to_the_second_upstream() {
+        let (primary, primary_count) = spawn_scripted_upstream(|_, _| {
+            http_error("503 Service Unavailable", "{\"error\":\"down\"}")
+        })
+        .await;
+        let (fallback, fallback_count) =
+            spawn_scripted_upstream(|_, _| sse_ok("ms/speech-1")).await;
+        let app = test_app_with_fallback(primary, fallback, &["m1"], &["ms/speech-1"]).await;
+        let token = app.token.clone();
+        let db = app.stats_db.clone();
+
+        let response = crate::build_router(Arc::clone(&app.state))
+            .oneshot(audio_chat_request(&token, "a1"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // Both audio ids on the primary are tried first, and only then does
+        // the request move to the voice fallback.
+        assert_eq!(primary_count.load(Ordering::SeqCst), 2);
+        assert_eq!(fallback_count.load(Ordering::SeqCst), 1);
+
+        let row = tracked_row(&db).await;
+        assert_eq!(row.model_used, "ms/speech-1");
+        assert_eq!(row.status, 200);
+        assert_eq!(row.key_label, "audio-fallback");
+    }
+
+    /// A text request never reaches the voice fallback, even when the primary
+    /// fails for it: the fallback upstream is configured for voice only.
+    #[tokio::test]
+    async fn a_text_request_never_reaches_the_voice_fallback() {
+        let (primary, _primary_count) = spawn_scripted_upstream(|_, _| {
+            http_error("503 Service Unavailable", "{\"error\":\"down\"}")
+        })
+        .await;
+        let (fallback, fallback_count) =
+            spawn_scripted_upstream(|_, _| sse_ok("ms/speech-1")).await;
+        let app = test_app_with_fallback(primary, fallback, &["m1"], &["ms/speech-1"]).await;
+        let token = app.token.clone();
+
+        let response = crate::build_router(Arc::clone(&app.state))
+            .oneshot(chat_request(&token, "m1", true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            fallback_count.load(Ordering::SeqCst),
+            0,
+            "a text request must never be sent to the voice fallback"
+        );
     }
 
     /// The split runs both ways: a chat id is not an audio model, and an
