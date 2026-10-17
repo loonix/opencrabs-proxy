@@ -91,6 +91,54 @@ impl AudioFallback {
     }
 }
 
+/// Rewrite every `input_audio` part so `data` holds a data URI.
+///
+/// A caller sends bare base64, which is the shape the OpenAI API documents.
+/// Some upstreams read that field as a URL or a data URI instead, and answer a
+/// bare base64 string with `InvalidParameter: The provided URL does not appear
+/// to be valid`. ModelScope does exactly that. A value that is already a data
+/// URI or an `http(s)` URL is left alone, the rest of the body is untouched,
+/// and the return value counts how many parts were rewritten.
+pub fn audio_parts_as_data_uris(body: &mut serde_json::Value) -> usize {
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return 0;
+    };
+    let mut converted = 0;
+    for message in messages.iter_mut() {
+        let Some(parts) = message.get_mut("content").and_then(|c| c.as_array_mut()) else {
+            continue;
+        };
+        for part in parts.iter_mut() {
+            let Some(audio) = part.get_mut("input_audio").and_then(|a| a.as_object_mut()) else {
+                continue;
+            };
+            let is_reference = audio
+                .get("data")
+                .and_then(|d| d.as_str())
+                .map(|d| {
+                    d.starts_with("data:") || d.starts_with("http://") || d.starts_with("https://")
+                })
+                .unwrap_or(true);
+            if is_reference {
+                continue;
+            }
+            let data = audio
+                .get("data")
+                .and_then(|d| d.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let format = audio
+                .get("format")
+                .and_then(|f| f.as_str())
+                .unwrap_or("wav");
+            let uri = format!("data:audio/{format};base64,{data}");
+            audio.insert("data".to_string(), serde_json::Value::String(uri));
+            converted += 1;
+        }
+    }
+    converted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,5 +194,100 @@ mod tests {
     #[should_panic(expected = "lists no model")]
     fn empty_model_list_is_an_error() {
         AudioFallback::from_values(Some("https://x.example"), Some("k"), Some(" , "));
+    }
+
+    fn audio_body(data: &str, format: &str) -> serde_json::Value {
+        serde_json::json!({
+            "model": "a/one",
+            "messages": [
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "what do you hear"},
+                    {"type": "input_audio", "input_audio": {"data": data, "format": format}}
+                ]}
+            ]
+        })
+    }
+
+    /// ModelScope reads the audio field as a URL or data URI and refuses bare
+    /// base64 with `InvalidParameter`. The fallback leg must hand it the form
+    /// it accepts, or every voice request that reaches the second upstream
+    /// comes back 400 and the caller sees the primary's error instead.
+    #[test]
+    fn bare_base64_becomes_a_data_uri() {
+        let mut body = audio_body("T2dnUw==", "ogg");
+        assert_eq!(audio_parts_as_data_uris(&mut body), 1);
+        assert_eq!(
+            body["messages"][1]["content"][1]["input_audio"]["data"],
+            "data:audio/ogg;base64,T2dnUw=="
+        );
+        // Nothing else moved: the text part and the system message stay put.
+        assert_eq!(body["messages"][0]["content"], "be brief");
+        assert_eq!(
+            body["messages"][1]["content"][0],
+            serde_json::json!({"type": "text", "text": "what do you hear"})
+        );
+    }
+
+    /// A part that already carries a data URI or a URL is left exactly as it
+    /// is, so a caller that speaks the upstream's own dialect is not mangled,
+    /// and a second pass over the same body changes nothing.
+    #[test]
+    fn a_reference_is_left_alone() {
+        for data in [
+            "data:audio/wav;base64,T2dnUw==",
+            "https://bucket.example/note.wav",
+            "http://bucket.example/note.wav",
+        ] {
+            let mut body = audio_body(data, "wav");
+            assert_eq!(audio_parts_as_data_uris(&mut body), 0, "data `{data}`");
+            assert_eq!(
+                body["messages"][1]["content"][1]["input_audio"]["data"],
+                data
+            );
+            assert_eq!(audio_parts_as_data_uris(&mut body), 0);
+        }
+    }
+
+    #[test]
+    fn a_body_without_audio_is_untouched() {
+        let mut body = serde_json::json!({
+            "model": "a/one",
+            "messages": [{"role": "user", "content": "plain text"}]
+        });
+        assert_eq!(audio_parts_as_data_uris(&mut body), 0);
+        assert_eq!(body["messages"][0]["content"], "plain text");
+
+        let mut no_messages = serde_json::json!({"model": "a/one"});
+        assert_eq!(audio_parts_as_data_uris(&mut no_messages), 0);
+    }
+
+    /// Two audio parts in one request are both rewritten, and the format is
+    /// taken from each part rather than assumed.
+    #[test]
+    fn every_audio_part_is_rewritten_with_its_own_format() {
+        let mut body = serde_json::json!({
+            "model": "a/one",
+            "messages": [{"role": "user", "content": [
+                {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "mp3"}},
+                {"type": "text", "text": "and this one"},
+                {"type": "input_audio", "input_audio": {"data": "BBBB", "format": "wav"}},
+                {"type": "input_audio", "input_audio": {"data": "CCCC"}}
+            ]}]
+        });
+        assert_eq!(audio_parts_as_data_uris(&mut body), 3);
+        let parts = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(
+            parts[0]["input_audio"]["data"],
+            "data:audio/mp3;base64,AAAA"
+        );
+        assert_eq!(
+            parts[2]["input_audio"]["data"],
+            "data:audio/wav;base64,BBBB"
+        );
+        assert_eq!(
+            parts[3]["input_audio"]["data"], "data:audio/wav;base64,CCCC",
+            "a missing format falls back to wav"
+        );
     }
 }

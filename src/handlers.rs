@@ -10,8 +10,8 @@ use axum::{
 use std::{net::SocketAddr, sync::Arc, time::Instant};
 
 use crate::{
-    allowlist::Allowlist, guard, install, limit, proxy, tokens, tracker::RequestRecord, vision,
-    AppState,
+    allowlist::Allowlist, audio, guard, install, limit, proxy, tokens, tracker::RequestRecord,
+    vision, AppState,
 };
 
 /// Label stored when a request never reached a caller (no or bad token).
@@ -73,6 +73,10 @@ async fn audio_fallback(
     start: Instant,
 ) -> Option<(String, proxy::ForwardResult)> {
     let fallback = state.audio_fallback.as_ref()?;
+    // The second upstream reads the audio field as a URL or a data URI while
+    // the caller sent bare base64, so the part is converted once here, before
+    // any attempt. The primary upstream is not affected: it already answered.
+    audio::audio_parts_as_data_uris(body_json);
     let url = fallback.chat_url();
     let policy = proxy::AttemptPolicy::header_only(state.rotation.attempt_timeout());
     for model in &fallback.models {
@@ -1225,12 +1229,20 @@ mod rotation_tests {
     /// and the row says so instead of borrowing a primary key label.
     #[tokio::test]
     async fn a_voice_request_falls_back_to_the_second_upstream() {
-        let (primary, primary_count) = spawn_scripted_upstream(|_, _| {
+        let primary_body = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let primary_recorder = Arc::clone(&primary_body);
+        let (primary, primary_count) = spawn_scripted_upstream(move |_, bytes| {
+            primary_recorder.lock().unwrap().extend_from_slice(bytes);
             http_error("503 Service Unavailable", "{\"error\":\"down\"}")
         })
         .await;
-        let (fallback, fallback_count) =
-            spawn_scripted_upstream(|_, _| sse_ok("ms/speech-1")).await;
+        let fallback_body = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fallback_recorder = Arc::clone(&fallback_body);
+        let (fallback, fallback_count) = spawn_scripted_upstream(move |_, bytes| {
+            fallback_recorder.lock().unwrap().extend_from_slice(bytes);
+            sse_ok("ms/speech-1")
+        })
+        .await;
         let app = test_app_with_fallback(primary, fallback, &["m1"], &["ms/speech-1"]).await;
         let token = app.token.clone();
         let db = app.stats_db.clone();
@@ -1244,6 +1256,20 @@ mod rotation_tests {
         // the request move to the voice fallback.
         assert_eq!(primary_count.load(Ordering::SeqCst), 2);
         assert_eq!(fallback_count.load(Ordering::SeqCst), 1);
+
+        // The primary upstream gets the caller's own shape, bare base64.
+        let sent_primary = String::from_utf8_lossy(&primary_body.lock().unwrap()).to_string();
+        assert!(
+            sent_primary.contains(r#""data":"T2dnUw==""#),
+            "the primary upstream must receive the caller's audio unchanged: {sent_primary}"
+        );
+        // The fallback upstream reads the field as a URL or data URI, so the
+        // part is converted on the way out. Bare base64 comes back 400 there.
+        let sent_fallback = String::from_utf8_lossy(&fallback_body.lock().unwrap()).to_string();
+        assert!(
+            sent_fallback.contains(r#""data":"data:audio/ogg;base64,T2dnUw==""#),
+            "the fallback upstream must receive a data URI: {sent_fallback}"
+        );
 
         let row = tracked_row(&db).await;
         assert_eq!(row.model_used, "ms/speech-1");
