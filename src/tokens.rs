@@ -171,13 +171,47 @@ pub fn revoke(path: &str, label: &str) -> Result<(), RevokeError> {
     }
     let tmp = format!("{path}.tmp");
     fs::write(&tmp, kept).map_err(|e| RevokeError::Failed(format!("write {tmp}: {e}")))?;
-    // A rename-replace takes the tmp file's mode, so carry the original over
-    // instead of letting the process umask decide.
-    if let Ok(meta) = fs::metadata(path) {
-        let _ = fs::set_permissions(&tmp, meta.permissions());
+    // A rename-replace takes the tmp file's mode and owner from the writing
+    // process, so carry both over from the file being replaced. The owner
+    // matters as much as the mode: a tokens file re-owned by the wrong user
+    // leaves the service unable to read it, which is a crash loop rather than
+    // one bad token.
+    let meta = match fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            return Err(RevokeError::Failed(format!("stat tokens file {path}: {e}")));
+        }
+    };
+    let _ = fs::set_permissions(&tmp, meta.permissions());
+    if let Err(e) = carry_owner(&tmp, &meta) {
+        let _ = fs::remove_file(&tmp);
+        return Err(RevokeError::Failed(format!(
+            "carry ownership onto {tmp}: {e}"
+        )));
     }
     fs::rename(&tmp, path)
         .map_err(|e| RevokeError::Failed(format!("replace tokens file {path}: {e}")))?;
+    Ok(())
+}
+
+/// Give `tmp` the same owner as the file it is about to replace, so a
+/// rename-replace cannot re-own it. Skipped when the owner already matches,
+/// which keeps an unprivileged caller from needing a chown it would be
+/// refused. Fails instead of silently re-owning the file.
+#[cfg(unix)]
+fn carry_owner(tmp: &str, target: &fs::Metadata) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let tmp_meta = fs::metadata(tmp).map_err(|e| format!("stat {tmp}: {e}"))?;
+    if tmp_meta.uid() == target.uid() && tmp_meta.gid() == target.gid() {
+        return Ok(());
+    }
+    std::os::unix::fs::chown(tmp, Some(target.uid()), Some(target.gid()))
+        .map_err(|e| format!("chown {tmp}: {e}"))
+}
+
+#[cfg(not(unix))]
+fn carry_owner(_tmp: &str, _target: &fs::Metadata) -> Result<(), String> {
     Ok(())
 }
 
@@ -365,6 +399,32 @@ mod tests {
 
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "revoke must not widen the file mode");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn revoke_keeps_the_file_owner() {
+        use std::os::unix::fs::MetadataExt;
+        let path = temp_tokens(
+            "revoke-owner",
+            &format!("{}{}", line("alice", "a"), line("bob", "b")),
+        );
+        // Only a privileged caller can hand a file to another owner, so the
+        // interesting half of this test needs root. That is the case that
+        // matters: the deploy runs the CLI as root over a systemd
+        // StateDirectory, where a re-owned file is unreadable to the service.
+        let could_reown = std::os::unix::fs::chown(&path, Some(65534), Some(65534)).is_ok();
+        let before = fs::metadata(&path).unwrap();
+
+        revoke(&path, "alice").unwrap();
+
+        let after = fs::metadata(&path).unwrap();
+        assert_eq!(after.uid(), before.uid(), "revoke must not re-own the file");
+        assert_eq!(after.gid(), before.gid(), "revoke must not re-own the file");
+        if could_reown {
+            assert_eq!(after.uid(), 65534, "root revoke must keep the owner");
+        }
         let _ = fs::remove_file(&path);
     }
 }
