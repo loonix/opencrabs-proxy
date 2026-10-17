@@ -40,10 +40,10 @@ pub const DEFAULT_IMAGE_MODELS: &str = "gemini-2.5-flash-image";
 
 /// Audio input ids. An id here is served only when a chat request carries an
 /// `input_audio` part, and only on `/v1/audio/*` passthrough. It is never a
-/// chat model, so a text prompt cannot be answered by a voice model. The
-/// first id is tried first, the rest are fallbacks in order. Set with
-/// `AUDIO_MODELS`.
-pub const DEFAULT_AUDIO_MODELS: &str = "mimo/mimo-v2.6-flash";
+/// chat model, so a text prompt cannot be answered by a voice model. The first
+/// id is tried first and the rest are fallbacks in order, so a caller names one
+/// voice id and the proxy walks the chain behind it. Set with `AUDIO_MODELS`.
+pub const DEFAULT_AUDIO_MODELS: &str = "mimo/mimo-v2.6-flash,ocg/mimo-v2.6-flash";
 
 /// Path prefix that selects the image list instead of the chat list.
 const IMAGE_PATH_PREFIX: &str = "/v1/images/";
@@ -250,7 +250,7 @@ mod tests {
 
     /// The image id the shipped defaults carry.
     const IMG: &str = "gemini-2.5-flash-image";
-    /// One audio id, since the list may carry fallbacks.
+    /// The first audio id, the one the plan tries first.
     const AUD: &str = "mimo/mimo-v2.6-flash";
 
     #[test]
@@ -324,14 +324,24 @@ mod tests {
         assert!(!a.allows_for_path("/v1/audio/transcriptions", DEFAULT_MODELS));
     }
 
-    /// What a client picks from is one id per capability: one chat id and one
-    /// image id. A second spelling of a model belongs in `ROTATION_MODELS`,
-    /// out of the client's sight, which is where the proxy walks it.
+    /// What a client picks from is one id per capability: one chat id, one
+    /// image id, and for voice a chain the caller never chooses from. A second
+    /// spelling of a model belongs in `ROTATION_MODELS`, out of the client's
+    /// sight, which is where the proxy walks it.
     #[test]
     fn shipped_defaults_show_one_id_per_capability() {
-        let a = Allowlist::parse(DEFAULT_MODELS).with_images(DEFAULT_IMAGE_MODELS);
+        let a = Allowlist::parse(DEFAULT_MODELS)
+            .with_images(DEFAULT_IMAGE_MODELS)
+            .with_audio(DEFAULT_AUDIO_MODELS);
         assert_eq!(a.names(), "deepseek-v4.1-flash");
         assert_eq!(a.image_names(), "gemini-2.5-flash-image");
+        assert_eq!(
+            a.audio_plan_for(AUD).unwrap(),
+            vec!["mimo/mimo-v2.6-flash", "ocg/mimo-v2.6-flash"]
+        );
+        // The second voice id is reachable only as the chain's next step.
+        assert!(a.audio_plan_for("ocg/mimo-v2.6-flash").is_some());
+        assert!(!a.allows("ocg/mimo-v2.6-flash"));
         let mut v = json!({"object": "list", "data": [
             {"id": "deepseek-v4.1-flash"},
             {"id": "ali/deepseek-v4.1-flash"},
