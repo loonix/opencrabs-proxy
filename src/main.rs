@@ -102,8 +102,8 @@ fn issue_command(label: &str) {
 fn revoke_command(label: &str) {
     let path = required("TOKENS_FILE");
     match tokens::revoke(&path, label) {
-        Ok(true) => eprintln!("Revoked `{label}`. Restart keyproxy so the running proxy drops it."),
-        Ok(false) => {
+        Ok(()) => eprintln!("Revoked `{label}`. Restart keyproxy so the running proxy drops it."),
+        Err(tokens::RevokeError::Unknown) => {
             eprintln!("error: no caller named `{label}` in {path}");
             std::process::exit(1);
         }
@@ -306,6 +306,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/stats", get(handlers::stats_endpoint))
         .route("/failures", get(handlers::failures_endpoint))
         .route("/upstream-health", get(handlers::upstream_health_endpoint))
+        // The path is not a secret: the admin token gates it, so knowing the
+        // route grants nothing. It exists so a token can be revoked inside the
+        // service namespace instead of by editing the file from the host.
+        .route("/admin/revoke", post(handlers::revoke_endpoint))
         .route("/v1/chat/completions", post(handlers::chat_completions))
         .route("/v1/models", get(handlers::list_models));
     // Mounted only when a path is configured, so the install path is deployment

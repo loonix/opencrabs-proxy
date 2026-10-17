@@ -10,7 +10,8 @@ use axum::{
 use std::{net::SocketAddr, sync::Arc, time::Instant};
 
 use crate::{
-    allowlist::Allowlist, guard, install, limit, proxy, tracker::RequestRecord, vision, AppState,
+    allowlist::Allowlist, guard, install, limit, proxy, tokens, tracker::RequestRecord, vision,
+    AppState,
 };
 
 /// Label stored when a request never reached a caller (no or bad token).
@@ -588,6 +589,63 @@ pub async fn issue_install(
             };
             rejected(&state, ip, ENDPOINT, status);
             (status, message).into_response()
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct RevokeRequest {
+    label: String,
+}
+
+/// Revoke a caller token. Requires the admin token, which is why this path can
+/// be a fixed name: knowing it grants nothing without the secret.
+///
+/// The write happens inside this process, as the service user. Editing the
+/// tokens file from the host instead is what broke the `StateDirectory` idmap
+/// and crash-looped the unit, so this route exists to make that unnecessary.
+/// The store is reloaded while the write lock is held, so the revoked token
+/// stops authenticating on its next request instead of at the next restart.
+pub async fn revoke_endpoint(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !guard::admin_ok(&headers, &state.admin_token) {
+        return (StatusCode::UNAUTHORIZED, "admin token required").into_response();
+    }
+    let label = serde_json::from_slice::<RevokeRequest>(&body)
+        .map(|r| r.label)
+        .unwrap_or_default();
+    if label.is_empty() {
+        return (StatusCode::BAD_REQUEST, "body must be JSON with a label").into_response();
+    }
+    // The write lock covers the removal and the reload, so a request racing an
+    // install cannot reload a store from a half-written file.
+    let outcome = {
+        let mut store = state.tokens.write().expect("tokens lock poisoned");
+        tokens::revoke_and_reload(&mut store, &state.tokens_path, &label)
+    };
+    match outcome {
+        Ok(()) => {
+            tracing::info!("revoked caller token `{label}`");
+            axum::Json(serde_json::json!({ "revoked": label })).into_response()
+        }
+        Err(tokens::RevokeError::Unknown) => {
+            (StatusCode::NOT_FOUND, "no caller with that label").into_response()
+        }
+        Err(tokens::RevokeError::WouldEmpty) => (
+            StatusCode::CONFLICT,
+            "refusing to revoke the last caller: the proxy will not start on an empty tokens file",
+        )
+            .into_response(),
+        Err(tokens::RevokeError::Failed(e)) => {
+            tracing::error!("token revocation failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not revoke the token",
+            )
+                .into_response()
         }
     }
 }
@@ -1551,5 +1609,84 @@ mod rotation_tests {
         assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
         let row = tracked_row_for(&db, "install").await;
         assert_eq!(row.status, 400);
+    }
+
+    /// The admin route is the only supported way to revoke: it writes as the
+    /// service user and reloads the store, so the token dies without a restart.
+    #[tokio::test]
+    async fn admin_revoke_drops_the_caller_token() {
+        let (upstream, _count) = spawn_scripted_upstream(|_, _| sse_ok("m1")).await;
+        let app = test_app(upstream, &["m1"], Duration::from_secs(5)).await;
+        // A second caller, so revoking one does not try to empty the file.
+        let doomed = tokens::issue(&app.state.tokens_path, "doomed").unwrap();
+
+        let body = serde_json::json!({ "label": "doomed" }).to_string();
+
+        // A caller token is not an admin token.
+        let unauth = crate::build_router(Arc::clone(&app.state))
+            .oneshot(post_json("/admin/revoke", &app.token, body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+        // An unknown label is reported, not silently accepted.
+        let missing = crate::build_router(Arc::clone(&app.state))
+            .oneshot(post_json(
+                "/admin/revoke",
+                "test-admin",
+                serde_json::json!({ "label": "nobody" }).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let response = crate::build_router(Arc::clone(&app.state))
+            .oneshot(post_json("/admin/revoke", "test-admin", body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let echoed = BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        assert!(String::from_utf8_lossy(&echoed).contains("doomed"));
+
+        // The reload happened in-process: the revoked token is refused now,
+        // while the other caller still works.
+        let dead = crate::build_router(Arc::clone(&app.state))
+            .oneshot(chat_request(&doomed, "m1", false))
+            .await
+            .unwrap();
+        assert_eq!(dead.status(), StatusCode::UNAUTHORIZED);
+
+        let alive = crate::build_router(Arc::clone(&app.state))
+            .oneshot(chat_request(&app.token, "m1", false))
+            .await
+            .unwrap();
+        assert_ne!(alive.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Revoking the last entry would leave a file the proxy refuses to start
+    /// on, so the route refuses it and the token keeps working.
+    #[tokio::test]
+    async fn admin_revoke_refuses_to_empty_the_tokens_file() {
+        let (upstream, _count) = spawn_scripted_upstream(|_, _| sse_ok("m1")).await;
+        let app = test_app(upstream, &["m1"], Duration::from_secs(5)).await;
+
+        let response = crate::build_router(Arc::clone(&app.state))
+            .oneshot(post_json(
+                "/admin/revoke",
+                "test-admin",
+                serde_json::json!({ "label": "test-caller" }).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let alive = crate::build_router(Arc::clone(&app.state))
+            .oneshot(chat_request(&app.token, "m1", false))
+            .await
+            .unwrap();
+        assert_ne!(alive.status(), StatusCode::UNAUTHORIZED);
     }
 }

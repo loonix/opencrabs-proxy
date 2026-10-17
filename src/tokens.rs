@@ -121,12 +121,36 @@ pub fn issue(path: &str, label: &str) -> Result<String, String> {
     Ok(token)
 }
 
-/// Remove the entry for `label` from the tokens file. Returns `false` when the
-/// label is not there. The running proxy keeps the token until it restarts.
-/// Refuses a removal that would leave the file with no entries, because the
-/// proxy will not start on an empty file.
-pub fn revoke(path: &str, label: &str) -> Result<bool, String> {
-    let text = fs::read_to_string(path).map_err(|e| format!("read tokens file {path}: {e}"))?;
+/// Why a revocation did not happen. The variants are separate so a caller can
+/// answer with the right status instead of matching on message text.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RevokeError {
+    /// No entry carries that label.
+    Unknown,
+    /// Removing it would leave the file with no usable entries, which the
+    /// proxy refuses to start on.
+    WouldEmpty,
+    /// Reading or writing the file failed. The text is safe to log.
+    Failed(String),
+}
+
+impl std::fmt::Display for RevokeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RevokeError::Unknown => write!(f, "no entry with that label"),
+            RevokeError::WouldEmpty => {
+                write!(f, "removing it would leave the tokens file unusable")
+            }
+            RevokeError::Failed(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Remove the entry for `label` from the tokens file. A running proxy keeps the
+/// token until it reloads the file.
+pub fn revoke(path: &str, label: &str) -> Result<(), RevokeError> {
+    let text = fs::read_to_string(path)
+        .map_err(|e| RevokeError::Failed(format!("read tokens file {path}: {e}")))?;
     let mut kept = String::new();
     let mut removed = false;
     for raw in text.lines() {
@@ -138,14 +162,41 @@ pub fn revoke(path: &str, label: &str) -> Result<bool, String> {
         kept.push('\n');
     }
     if !removed {
-        return Ok(false);
+        return Err(RevokeError::Unknown);
     }
-    TokenStore::parse(&kept)
-        .map_err(|e| format!("revoking `{label}` would leave the tokens file unusable: {e}"))?;
+    // The file parsed when the proxy loaded it, so removing one line can only
+    // fail the parse by leaving it empty.
+    if TokenStore::parse(&kept).is_err() {
+        return Err(RevokeError::WouldEmpty);
+    }
     let tmp = format!("{path}.tmp");
-    fs::write(&tmp, kept).map_err(|e| format!("write {tmp}: {e}"))?;
-    fs::rename(&tmp, path).map_err(|e| format!("replace tokens file {path}: {e}"))?;
-    Ok(true)
+    fs::write(&tmp, kept).map_err(|e| RevokeError::Failed(format!("write {tmp}: {e}")))?;
+    // A rename-replace takes the tmp file's mode, so carry the original over
+    // instead of letting the process umask decide.
+    if let Ok(meta) = fs::metadata(path) {
+        let _ = fs::set_permissions(&tmp, meta.permissions());
+    }
+    fs::rename(&tmp, path)
+        .map_err(|e| RevokeError::Failed(format!("replace tokens file {path}: {e}")))?;
+    Ok(())
+}
+
+/// Remove `label` and reload `store` from the file, so the revoked token stops
+/// authenticating on the next request instead of at the next restart. The
+/// caller holds the write lock across both steps.
+pub fn revoke_and_reload(
+    store: &mut TokenStore,
+    path: &str,
+    label: &str,
+) -> Result<(), RevokeError> {
+    revoke(path, label)?;
+    match TokenStore::load(path) {
+        Ok(reloaded) => {
+            *store = reloaded;
+            Ok(())
+        }
+        Err(e) => Err(RevokeError::Failed(e)),
+    }
 }
 
 #[cfg(test)]
@@ -252,7 +303,7 @@ mod tests {
             "revoke",
             &format!("{}{}", line("alice", "a"), line("bob", "b")),
         );
-        assert_eq!(revoke(&path, "alice"), Ok(true));
+        assert_eq!(revoke(&path, "alice"), Ok(()));
         let store = TokenStore::load(&path).unwrap();
         assert!(!store.has_label("alice"));
         assert_eq!(store.lookup("a"), None);
@@ -264,7 +315,7 @@ mod tests {
     fn revoke_unknown_label_changes_nothing() {
         let before = line("alice", "a");
         let path = temp_tokens("revoke-missing", &before);
-        assert_eq!(revoke(&path, "nobody"), Ok(false));
+        assert_eq!(revoke(&path, "nobody"), Err(RevokeError::Unknown));
         assert_eq!(fs::read_to_string(&path).unwrap(), before);
         let _ = fs::remove_file(&path);
     }
@@ -273,8 +324,47 @@ mod tests {
     fn revoke_refuses_to_empty_the_file() {
         let before = line("alice", "a");
         let path = temp_tokens("revoke-last", &before);
-        assert!(revoke(&path, "alice").is_err());
+        assert_eq!(revoke(&path, "alice"), Err(RevokeError::WouldEmpty));
         assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn revoke_and_reload_drops_the_token_from_memory() {
+        let path = temp_tokens(
+            "revoke-reload",
+            &format!("{}{}", line("alice", "a"), line("bob", "b")),
+        );
+        let mut store = TokenStore::load(&path).unwrap();
+        assert_eq!(store.lookup("a"), Some("alice"));
+
+        assert_eq!(revoke_and_reload(&mut store, &path, "alice"), Ok(()));
+        assert_eq!(store.lookup("a"), None);
+        assert_eq!(store.lookup("b"), Some("bob"));
+
+        // A label that is not there must not disturb the loaded store.
+        assert_eq!(
+            revoke_and_reload(&mut store, &path, "nobody"),
+            Err(RevokeError::Unknown)
+        );
+        assert_eq!(store.lookup("b"), Some("bob"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn revoke_keeps_the_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_tokens(
+            "revoke-mode",
+            &format!("{}{}", line("alice", "a"), line("bob", "b")),
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        revoke(&path, "alice").unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "revoke must not widen the file mode");
         let _ = fs::remove_file(&path);
     }
 }

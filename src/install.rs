@@ -151,7 +151,7 @@ mod tests {
         let mut store = TokenStore::load(&path).unwrap();
         let first = issue_for(&mut store, &path, ID).unwrap();
 
-        assert_eq!(tokens::revoke(&path, ID), Ok(true));
+        assert_eq!(tokens::revoke(&path, ID), Ok(()));
         let mut reloaded = TokenStore::load(&path).unwrap();
         assert_eq!(
             reloaded.lookup(&first),
