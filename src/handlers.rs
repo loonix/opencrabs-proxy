@@ -212,8 +212,20 @@ pub async fn chat_completions(
         return refuse_model(&state, ip, caller, endpoint, &model_used);
     }
 
-    // Ask the upstream to report token usage, streaming or not.
-    body_json["stream_options"] = serde_json::json!({"include_usage": true});
+    // Whether the caller asked for a stream decides how the request is timed
+    // below and whether the upstream is asked for token usage.
+    let wants_stream = body_json
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // Token usage on a streaming answer arrives in the final chunk, and only
+    // when `stream_options` was sent. A non-streaming answer reports usage on
+    // its own, while `stream_options` without `stream` is a 400 on one
+    // publisher and a hang on another, so it goes only on a streaming request.
+    if wants_stream {
+        body_json["stream_options"] = serde_json::json!({"include_usage": true});
+    }
 
     // Rotation: the requested model tries first, then the remaining
     // candidates. A candidate counts as failed on transport death, no headers
@@ -221,10 +233,6 @@ pub async fn chat_completions(
     // budget (small streaming requests only; compaction-scale bodies are
     // exempt), or an upstream 5xx. A 4xx is the upstream speaking for this
     // exact request and is never retried.
-    let wants_stream = body_json
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
     // An audio request is tried on the audio list only: the requested id
     // first, the remaining audio ids after it. The rotation candidates are
     // text models, so they are never part of an audio plan.
@@ -1105,6 +1113,47 @@ mod rotation_tests {
         assert_eq!(row.plan_len, Some(2));
         assert_eq!(row.failure_reason, None);
         assert!(!row.truncated);
+    }
+
+    /// `stream_options` is what makes the final stream chunk carry token
+    /// usage. Without `stream` one publisher answers 400 and another hangs
+    /// until the attempt budget runs out, so it goes upstream only when the
+    /// caller asked to stream. Both requests here are answered with SSE; what
+    /// is checked is the body that left the proxy.
+    #[tokio::test]
+    async fn stream_options_goes_upstream_only_on_a_streaming_request() {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let (upstream, _count) = spawn_scripted_upstream(move |_, raw| {
+            let text = String::from_utf8_lossy(raw).to_string();
+            let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+            recorder.lock().unwrap().push(body);
+            sse_ok("m1")
+        })
+        .await;
+        let app = test_app(upstream, &["m1"], Duration::from_secs(5)).await;
+        let token = app.token.clone();
+
+        for stream in [false, true] {
+            let response = crate::build_router(Arc::clone(&app.state))
+                .oneshot(chat_request(&token, "m1", stream))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let bodies = seen.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "expected one upstream call per request");
+        assert!(
+            !bodies[0].contains("stream_options"),
+            "a non-streaming request carried stream_options: {}",
+            bodies[0]
+        );
+        assert!(
+            bodies[1].contains("stream_options"),
+            "a streaming request lost stream_options: {}",
+            bodies[1]
+        );
     }
 
     #[test]
