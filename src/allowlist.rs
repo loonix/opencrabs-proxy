@@ -22,7 +22,7 @@ pub const DEFAULT_MODELS: &str = "cb/deepseek-v4.1-flash";
 /// Image generation ids served on `/v1/images/*` only. Each id is written the
 /// way the upstream lists it, `provider/model`, and is sent on unchanged: the
 /// proxy never adds or strips a prefix.
-pub const DEFAULT_IMAGE_MODELS: &str = "cb/gemini-2.5-flash-image";
+pub const DEFAULT_IMAGE_MODELS: &str = "cb/gemini-2.5-flash-image,gemini-2.5-flash-image";
 
 /// Path prefix that selects the image list instead of the chat list.
 const IMAGE_PATH_PREFIX: &str = "/v1/images/";
@@ -179,22 +179,23 @@ mod tests {
         assert_eq!(v, json!({"error": "nope"}));
     }
 
+    /// One image id, since the default list now carries two.
+    const IMG: &str = "cb/gemini-2.5-flash-image";
+
     #[test]
     fn image_id_is_never_a_chat_model() {
         let a = Allowlist::parse(DEFAULT_MODELS).with_images(DEFAULT_IMAGE_MODELS);
-        assert!(!a.allows(DEFAULT_IMAGE_MODELS));
+        assert!(!a.allows(IMG));
         assert!(a.allows_for_path("/v1/chat/completions", DEFAULT_MODELS));
-        assert!(!a.allows_for_path("/v1/chat/completions", DEFAULT_IMAGE_MODELS));
-        assert!(!a.allows_for_path(
-            &format!("/v1/models/{DEFAULT_IMAGE_MODELS}"),
-            DEFAULT_IMAGE_MODELS
-        ));
+        assert!(!a.allows_for_path("/v1/chat/completions", IMG));
+        assert!(!a.allows_for_path(&format!("/v1/models/{IMG}"), IMG));
     }
 
     #[test]
     fn image_route_accepts_only_image_ids() {
         let a = Allowlist::parse(DEFAULT_MODELS).with_images(DEFAULT_IMAGE_MODELS);
-        assert!(a.allows_for_path("/v1/images/generations", DEFAULT_IMAGE_MODELS));
+        assert!(a.allows_for_path("/v1/images/generations", IMG));
+        assert!(a.allows_for_path("/v1/images/generations", "gemini-2.5-flash-image"));
         assert!(!a.allows_for_path("/v1/images/generations", DEFAULT_MODELS));
     }
 
@@ -203,7 +204,7 @@ mod tests {
         let a = Allowlist::parse(DEFAULT_MODELS).with_images(DEFAULT_IMAGE_MODELS);
         let mut v = json!({"object": "list", "data": [
             {"id": DEFAULT_MODELS},
-            {"id": DEFAULT_IMAGE_MODELS},
+            {"id": IMG},
         ]});
         a.filter_models(&mut v);
         assert_eq!(v["data"].as_array().unwrap().len(), 1);
@@ -213,7 +214,7 @@ mod tests {
     #[test]
     fn images_default_to_off() {
         let a = Allowlist::parse(DEFAULT_MODELS);
-        assert!(!a.allows_for_path("/v1/images/generations", DEFAULT_IMAGE_MODELS));
+        assert!(!a.allows_for_path("/v1/images/generations", IMG));
         assert_eq!(a.image_names(), "");
     }
 
