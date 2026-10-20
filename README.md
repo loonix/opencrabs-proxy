@@ -274,6 +274,35 @@ table, so balance history is queryable rather than only current. `/stats` under
 requests served, whether it is drained or rate-limited, and the age of its last
 balance reading.
 
+## Public usage snapshot
+
+`opencrabs.com/stats/` shows how much traffic the proxy serves. It reads one
+static file, never the proxy itself:
+
+```
+keyproxy export-public-stats --db /var/lib/keyproxy/stats.db --out /srv/opencrabs/stats/public.json
+```
+
+The output is an allowlist: a fixed struct filled from aggregate SQL, with no
+database row ever serialized. Provider prefixes, caller IPs, token labels,
+upstream publishers and failure detail never leave the box; model ids are
+reduced to a capability bucket. The leak test in `src/public_stats.rs` greps the
+serialized output for the names it must never contain, so a field added without
+thinking fails the suite.
+
+`deploy/keyproxy-public-stats.timer` runs the command every five minutes and
+`deploy/keyproxy-public-stats.service` carries the hardening: read one file,
+write one directory, no network. Install both with the rest of the deploy:
+
+```
+install -m 0644 deploy/keyproxy-public-stats.service deploy/keyproxy-public-stats.timer /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now keyproxy-public-stats.timer
+```
+
+The dashboard container mounts `/srv/opencrabs/stats` read-only and serves it
+under `/stats-data/`. Nothing in the container writes to that path.
+
 ## Build and test
 
 ```
