@@ -1,0 +1,15 @@
+[Unit]
+Description=Refresh the public usage snapshot every 5 minutes
+Documentation=https://github.com/opencrabs/opencrabs-proxy
+
+[Timer]
+# Every five minutes keeps the dashboard fresh without hammering a 30 MB
+# database, and OnBootSec makes the first snapshot land right after boot
+# instead of waiting for the next five minute boundary.
+OnBootSec=1min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=keyproxy-public-stats.service
+
+[Install]
+WantedBy=timers.target

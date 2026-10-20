@@ -26,6 +26,7 @@ mod limit;
 mod passthrough;
 mod probe;
 mod proxy;
+mod public_stats;
 mod rate;
 mod rotation;
 mod tokens;
@@ -135,6 +136,10 @@ async fn main() {
             std::process::exit(2);
         });
         revoke_command(label);
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("export-public-stats") {
+        public_stats::export_command(&args[2..]);
         return;
     }
 

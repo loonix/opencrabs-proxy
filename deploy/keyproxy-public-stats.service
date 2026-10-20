@@ -1,0 +1,27 @@
+[Unit]
+Description=keyproxy public stats snapshot
+Documentation=https://github.com/opencrabs/opencrabs-proxy
+# The database lives on the same host, so the only ordering that matters is
+# that the filesystem is up. The proxy does not have to be running: the
+# database is read as a file and a writer lock is handled by the busy timeout.
+After=local-fs.target
+
+[Service]
+Type=oneshot
+# The stats database is owned by `nobody` because keyproxy runs with
+# DynamicUser=yes, and it is mode 0644. This unit runs as root so it can read
+# that path without a group grant, and it deliberately does NOT use
+# DynamicUser: a dynamic uid would be a different user and could not read it.
+ExecStart=/usr/local/bin/keyproxy export-public-stats --db /var/lib/keyproxy/stats.db --out /srv/opencrabs/stats/public.json
+
+# Hardening: read one file, write one directory, nothing else.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=none
+# The only writable path is the directory the snapshot lands in.
+ReadWritePaths=/srv/opencrabs/stats
+# Reading /var/lib/keyproxy needs the path visible under ProtectSystem=strict;
+# it is not under /usr, /boot or /etc, so it stays readable.
