@@ -25,7 +25,9 @@ use std::time::Duration;
 
 /// Bumped when a field is renamed or removed, so the page can refuse a shape it
 /// does not understand instead of rendering blanks.
-pub const SCHEMA: u32 = 1;
+/// Bumped to 2 when the distinct-caller counts were added. The page reads the
+/// version so a stale snapshot cannot be rendered as zeros.
+pub const SCHEMA: u32 = 2;
 
 /// Days of per-day rows carried in the snapshot. Weekly and monthly rollups are
 /// computed in the browser from this one series, so there is one source of
@@ -60,6 +62,13 @@ pub struct Totals {
     pub cache_hit_pct: f64,
     pub reasoning_tokens: u64,
     pub median_latency_ms: u64,
+    /// Distinct caller IPs. A count only: the addresses themselves never leave
+    /// the database. This is reach, not a headcount, because a rotating mobile
+    /// address counts again and a shared office address counts once.
+    pub unique_ips: u64,
+    /// Distinct client labels. Also a count only. The closer measure of "how
+    /// many API clients": one client on several addresses counts once.
+    pub unique_clients: u64,
 }
 
 #[derive(Serialize, Debug, Default)]
@@ -70,6 +79,9 @@ pub struct Window {
     pub cached_tokens: u64,
     pub cache_hit_pct: f64,
     pub median_latency_ms: u64,
+    /// Distinct caller IPs inside this window, count only.
+    pub unique_ips: u64,
+    pub unique_clients: u64,
 }
 
 /// Trailing windows, computed in SQL so the page does not have to reconcile
@@ -89,6 +101,10 @@ pub struct DailyPoint {
     pub output_tokens: u64,
     pub cached_tokens: u64,
     pub median_latency_ms: u64,
+    /// Distinct caller IPs that day, count only.
+    pub unique_ips: u64,
+    /// Distinct client labels that day, count only.
+    pub unique_clients: u64,
 }
 
 #[derive(Serialize, Debug)]
@@ -218,13 +234,15 @@ pub fn build(db: &Connection) -> PublicStats {
 }
 
 fn totals(db: &Connection) -> Totals {
-    let (requests, input, output, cached, reasoning) = db
+    let (requests, input, output, cached, reasoning, ips, clients) = db
         .query_row(
             "SELECT COUNT(*), \
                     COALESCE(SUM(prompt_tokens), 0), \
                     COALESCE(SUM(completion_tokens), 0), \
                     COALESCE(SUM(cached_tokens), 0), \
-                    COALESCE(SUM(reasoning_tokens), 0) \
+                    COALESCE(SUM(reasoning_tokens), 0), \
+                    COUNT(DISTINCT ip), \
+                    COUNT(DISTINCT token_label) \
              FROM requests",
             [],
             |r| {
@@ -234,10 +252,12 @@ fn totals(db: &Connection) -> Totals {
                     r.get::<_, i64>(2)?,
                     r.get::<_, i64>(3)?,
                     r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
                 ))
             },
         )
-        .unwrap_or((0, 0, 0, 0, 0));
+        .unwrap_or((0, 0, 0, 0, 0, 0, 0));
     Totals {
         requests: count(requests),
         input_tokens: count(input),
@@ -246,16 +266,20 @@ fn totals(db: &Connection) -> Totals {
         cache_hit_pct: pct(cached, input),
         reasoning_tokens: count(reasoning),
         median_latency_ms: median_latency(db, None),
+        unique_ips: count(ips),
+        unique_clients: count(clients),
     }
 }
 
 fn window(db: &Connection, since: &str) -> Window {
-    let (requests, input, output, cached) = db
+    let (requests, input, output, cached, ips, clients) = db
         .query_row(
             "SELECT COUNT(*), \
                     COALESCE(SUM(prompt_tokens), 0), \
                     COALESCE(SUM(completion_tokens), 0), \
-                    COALESCE(SUM(cached_tokens), 0) \
+                    COALESCE(SUM(cached_tokens), 0), \
+                    COUNT(DISTINCT ip), \
+                    COUNT(DISTINCT token_label) \
              FROM requests WHERE ts >= datetime('now', ?1)",
             [since],
             |r| {
@@ -264,10 +288,12 @@ fn window(db: &Connection, since: &str) -> Window {
                     r.get::<_, i64>(1)?,
                     r.get::<_, i64>(2)?,
                     r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
                 ))
             },
         )
-        .unwrap_or((0, 0, 0, 0));
+        .unwrap_or((0, 0, 0, 0, 0, 0));
     Window {
         requests: count(requests),
         input_tokens: count(input),
@@ -275,6 +301,8 @@ fn window(db: &Connection, since: &str) -> Window {
         cached_tokens: count(cached),
         cache_hit_pct: pct(cached, input),
         median_latency_ms: median_latency(db, Some(since)),
+        unique_ips: count(ips),
+        unique_clients: count(clients),
     }
 }
 
@@ -289,7 +317,9 @@ fn daily(db: &Connection) -> Vec<DailyPoint> {
                    SELECT date(ts) AS day, COUNT(*) AS requests, \
                           COALESCE(SUM(prompt_tokens), 0) AS input_tokens, \
                           COALESCE(SUM(completion_tokens), 0) AS output_tokens, \
-                          COALESCE(SUM(cached_tokens), 0) AS cached_tokens \
+                          COALESCE(SUM(cached_tokens), 0) AS cached_tokens, \
+                          COUNT(DISTINCT ip) AS unique_ips, \
+                          COUNT(DISTINCT token_label) AS unique_clients \
                    FROM requests WHERE ts >= datetime('now', ?1) GROUP BY day \
                ), \
                l AS ( \
@@ -302,7 +332,7 @@ fn daily(db: &Connection) -> Vec<DailyPoint> {
                    ) WHERE rn = CAST(ROUND((cnt - 1) * 0.5) AS INTEGER) + 1 \
                ) \
                SELECT d.day, d.requests, d.input_tokens, d.output_tokens, d.cached_tokens, \
-                      COALESCE(l.latency_ms, 0) \
+                      COALESCE(l.latency_ms, 0), d.unique_ips, d.unique_clients \
                FROM d LEFT JOIN l ON l.day = d.day ORDER BY d.day";
     let mut out = Vec::new();
     if let Ok(mut stmt) = db.prepare(sql) {
@@ -314,6 +344,8 @@ fn daily(db: &Connection) -> Vec<DailyPoint> {
                 output_tokens: count(r.get::<_, i64>(3)?),
                 cached_tokens: count(r.get::<_, i64>(4)?),
                 median_latency_ms: count(r.get::<_, i64>(5)?),
+                unique_ips: count(r.get::<_, i64>(6)?),
+                unique_clients: count(r.get::<_, i64>(7)?),
             })
         }) {
             out.extend(rows.flatten());
@@ -514,21 +546,30 @@ mod tests {
 
     /// Insert one synthetic chat-completions row described by `row`.
     fn insert(db: &Connection, row: Row<'_>) {
+        insert_caller(db, row, "198.51.100.7", "alice");
+    }
+
+    /// Same row with a chosen caller identity, so the distinct counts have
+    /// something to tell apart. Documentation-range addresses (RFC 5737) and
+    /// invented labels, never anything out of a real database.
+    fn insert_caller(db: &Connection, row: Row<'_>, ip: &str, label: &str) {
         db.execute(
             "INSERT INTO requests \
              (ts, ip, endpoint, model_requested, model_used, status, latency_ms, \
               prompt_tokens, completion_tokens, total_tokens, cached_tokens, \
               reasoning_tokens, token_label, attempts, plan_len, served_index, \
               key_label, upstream_publisher, truncated) \
-             VALUES (datetime('now', ?1), '198.51.100.7', '/v1/chat/completions', ?2, ?2, 200, ?3, \
-                     ?4, ?5, ?4 + ?5, ?6, 0, 'alice', 1, 1, 0, 'key-a', 'pub-x', 0)",
+             VALUES (datetime('now', ?1), ?2, '/v1/chat/completions', ?3, ?3, 200, ?4, \
+                     ?5, ?6, ?5 + ?6, ?7, 0, ?8, 1, 1, 0, 'key-a', 'pub-x', 0)",
             rusqlite::params![
                 row.offset,
+                ip,
                 row.model,
                 row.latency_ms,
                 row.prompt,
                 row.completion,
-                row.cached
+                row.cached,
+                label
             ],
         )
         .unwrap();
@@ -658,6 +699,46 @@ mod tests {
     }
 
     #[test]
+    fn distinct_callers_dedupe_by_ip_and_by_label() {
+        let db = fixture();
+        let row = |offset: &'static str| Row {
+            offset,
+            model: "chat-model",
+            latency_ms: 100,
+            prompt: 100,
+            completion: 10,
+            cached: 0,
+        };
+        // Two addresses and two labels across four rows: alice shows up twice on
+        // each address, bob shares the first. The counts must come out as 2 and
+        // 2, not 4 and 4.
+        insert_caller(&db, row("+0 seconds"), "203.0.113.1", "alice");
+        insert_caller(&db, row("+0 seconds"), "203.0.113.1", "bob");
+        insert_caller(&db, row("+0 seconds"), "203.0.113.2", "alice");
+        insert_caller(&db, row("+0 seconds"), "203.0.113.2", "alice");
+        // One more outside every rolling window but inside the daily series.
+        insert_caller(&db, row("-10 days"), "203.0.113.9", "carol");
+
+        let s = build(&db);
+        assert_eq!(s.totals.requests, 5);
+        assert_eq!(s.totals.unique_ips, 3);
+        assert_eq!(s.totals.unique_clients, 3);
+
+        assert_eq!(s.windows.h24.requests, 4);
+        assert_eq!(s.windows.h24.unique_ips, 2);
+        assert_eq!(s.windows.h24.unique_clients, 2);
+        assert_eq!(s.windows.d7.unique_ips, 2);
+        assert_eq!(s.windows.d30.unique_ips, 3);
+
+        let today = s.daily.last().unwrap();
+        assert_eq!(today.unique_ips, 2);
+        assert_eq!(today.unique_clients, 2);
+        let old = s.daily.first().unwrap();
+        assert_eq!(old.unique_ips, 1);
+        assert_eq!(old.unique_clients, 1);
+    }
+
+    #[test]
     fn hourly_always_carries_twenty_four_buckets() {
         let db = four_rows();
         let s = build(&db);
@@ -724,6 +805,8 @@ mod tests {
             "date",
             "hour",
             "kind",
+            "unique_ips",
+            "unique_clients",
         ];
         for key in &keys {
             assert!(
@@ -871,9 +954,17 @@ mod tests {
         let clean = serde_json::to_string(&build(&four_rows())).unwrap();
         assert!(leaks(&clean).is_empty(), "the clean snapshot is not clean");
 
+        // Anchored on the live schema number rather than a literal: a hardcoded
+        // 1 stopped matching the moment the schema was bumped, so the injection
+        // silently did nothing and this test proved nothing.
+        let anchor = format!("\"schema\":{SCHEMA}");
+        assert!(
+            clean.contains(&anchor),
+            "the serialized snapshot does not carry {anchor}: {clean}"
+        );
         let injected = clean.replace(
-            "\"schema\":1",
-            "\"schema\":1,\"model\":\"cb/deepseek-v4.1-flash\"",
+            &anchor,
+            &format!("{anchor},\"model\":\"cb/deepseek-v4.1-flash\""),
         );
         let found = leaks(&injected);
         // Both the provider prefix and the vendor name are caught. Pinning the
